@@ -4,7 +4,8 @@ import re
 from pathlib import Path
 from typing import ClassVar
 
-from .base import Tool
+from ..sandbox import WorkspacePathPolicy
+from .base import Tool, ToolEffect
 
 # skip these dirs to avoid noise
 _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", "dist", "build"}
@@ -12,6 +13,7 @@ _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", "d
 
 class GrepTool(Tool):
     name = "grep"
+    effect = ToolEffect.READ
     description = (
         "Search file contents with regex. "
         "Returns matching lines with file path and line number."
@@ -35,13 +37,28 @@ class GrepTool(Tool):
         "required": ["pattern"],
     }
 
+    def __init__(self, path_policy: WorkspacePathPolicy | None = None):
+        self.path_policy = path_policy
+
     def execute(self, pattern: str, path: str = ".", include: str | None = None) -> str:
         try:
             regex = re.compile(pattern)
         except re.error as e:
             return f"Invalid regex: {e}"
 
-        base = Path(path).expanduser().resolve()
+        if self.path_policy and include and (
+            Path(include).is_absolute() or ".." in Path(include).parts
+        ):
+            return "Error: include pattern may not escape the sandbox workspace"
+
+        try:
+            base = (
+                self.path_policy.resolve(path)
+                if self.path_policy
+                else Path(path).expanduser().resolve()
+            )
+        except ValueError as e:
+            return f"Error: {e}"
         if not base.exists():
             return f"Error: {path} not found"
 
@@ -50,6 +67,8 @@ class GrepTool(Tool):
             scan_truncated = False
         else:
             files, scan_truncated = self._walk(base, include)
+            if self.path_policy:
+                files = [fp for fp in files if self.path_policy.contains(fp)]
 
         scan_limit_msg = "... (5000 file scan limit reached; results may be incomplete)"
         matches = []

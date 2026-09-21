@@ -4,71 +4,82 @@ agent 有一个绕不过去的物理约束：上下文窗口就那么大。
 
 而编码任务偏偏极其能产 token。模型读一个一千行的文件，那一千行连同行号全进了历史；跑一次测试，几百行输出全进了历史；grep 一下，几十个匹配全进了历史。一个稍微像样的任务转上十几轮，几万 token 就没了。窗口一旦塞满，要么 API 报错，要么你得砍历史，而砍历史砍不好，agent 就会「忘事」，前面读过的文件转头又读一遍，刚做过的决定又推翻重来。
 
-所以怎么在有限窗口里装下一个长任务，是 agent 工程里最硬核的子问题之一。这一篇看 `corecoder/context.py`（210 行）怎么解。
+所以怎么在有限窗口里装下一个长任务，是 agent 工程里最硬核的子问题之一。这一篇看 `corecoder/context.py`（431 行）怎么解。
+
+先把一个常见误区说清：上下文窗口限制的不是 `messages` 一项，而是整个请求。动态 system prompt、Tool Schema、消息协议开销都占输入 token，模型还必须留出生成答案的空间。只看聊天历史，会在工具多、system prompt 长或者输出上限高的时候严重高估可用空间。
 
 ## 分层，从轻到重
 
-Claude Code 的策略公开拆解里是四层，从最廉价的处理逐级升到最激进的。CoreCoder 蒸馏成三层，思路一致：能用便宜手段省出来的空间，绝不动用贵手段。三层分别在窗口用到一定比例时才触发：
+Claude Code 的策略公开拆解里是四层，从最廉价的处理逐级升到最激进的。CoreCoder 蒸馏成三层，思路一致：能用便宜手段省出来的空间，绝不动用贵手段。但阈值不是直接乘整个模型窗口，而是先算出真正能留给 conversation 的预算：
 
 ```python
-self._snip_at = int(max_tokens * 0.50)      # 50% -> 截断臃肿的工具输出
-self._summarize_at = int(max_tokens * 0.70)  # 70% -> LLM 摘要旧对话
-self._collapse_at = int(max_tokens * 0.90)   # 90% -> 硬折叠，最后手段
+message_budget = (
+    max_tokens
+    - fixed_tokens       # system prompt + Tool Schema + 请求协议开销
+    - output_reserve     # 给本轮 completion 留出的空间
+    - safety_margin      # 估算器误差余量
+)
+snip_at = int(message_budget * 0.50)
+summarize_at = int(message_budget * 0.70)
+collapse_at = int(message_budget * 0.90)
 ```
 
-`maybe_compress` 是调度者，它先估算当前用了多少 token，然后从轻到重地按需施加每一层，每施加一层就重新估一次，够了就停：
+`Agent.compress_context()` 每一轮在请求 LLM 前重算 system prompt 和工具 schemas，通过 `estimate_request_tokens()` 得到固定开销，再把剩余预算交给 `ContextManager.maybe_compress()`。这样 plan mode、todo 状态、工具集或输出上限变化后，预算也跟着变。
+
+`maybe_compress` 从轻到重施加三层，每层之后重新估算；最后的 `_fit_to_budget` 是硬后置条件，而不只是启发式建议：
 
 ```python
-def maybe_compress(self, messages, llm=None) -> bool:
+def maybe_compress(
+    self, messages, llm=None, *,
+    fixed_tokens=0, output_reserve=0,
+    protected_tool_call_ids=None,
+) -> bool:
+    budget = self.available_message_tokens(fixed_tokens, output_reserve)
     current = estimate_tokens(messages)
-    compressed = False
 
-    if current > self._snip_at:
-        if self._snip_tool_outputs(messages):
-            compressed = True
-            current = estimate_tokens(messages)
+    if current > int(budget * 0.50):
+        self._snip_tool_outputs(messages, protected_tool_call_ids)
+        current = estimate_tokens(messages)
 
-    if current > self._summarize_at and len(messages) > 10:
-        if self._summarize_old(messages, llm, keep_recent=8):
-            compressed = True
-            current = estimate_tokens(messages)
+    if current > int(budget * 0.70) and len(messages) > 10:
+        self._summarize_old(messages, llm, keep_recent=8)
+        current = estimate_tokens(messages)
 
-    if current > self._collapse_at and len(messages) > 4:
+    if current > int(budget * 0.90) and len(messages) > 4:
         self._hard_collapse(messages, llm)
-        compressed = True
 
-    return compressed
+    if estimate_tokens(messages) > budget:
+        self._fit_to_budget(messages, budget, protected_tool_call_ids)
+
+    if estimate_tokens(messages) > budget:
+        raise ContextOverflowError(...)
 ```
 
-上一篇和上上篇里那两处 `self.context.maybe_compress(...)`，调的就是这里。它在每次发请求前、每轮工具执行后都喊一声，但绝大多数时候窗口没满，这函数什么都不做就返回了。压缩是惰性的，只在真要撞墙时才花力气。
+压缩只放在每次 LLM 请求之前。工具执行完不会立刻截它的结果；下一轮开始时，Agent 把这些 `tool_call_id` 标记为「尚未消费」，普通 snip 会跳过它们。只有一次 LLM 请求成功返回后，这批保护才解除。于是最新 Tool Result 至少有一次机会完整进入模型，而不是刚执行完就被上下文管理器截掉。如果最新结果自身大到整个批次无法放进窗口，最终适配步骤才会把它压成带明确标记的有界 observation。
 
-至于 token 怎么估的，`estimate_tokens` 用了一个糙到可爱的办法：字符数除以 3。
+token 估算仍然保持零依赖，但不再是统一的「字符数除以 3」。`_approx_tokens` 分别处理 CJK、符号密集的代码和普通文本；`estimate_tokens` 还计算每条消息、`tool_calls` 和 `tool_call_id` 的协议开销，`estimate_tool_schema_tokens` 则单独计算 schemas：
 
 ```python
 def _approx_tokens(text: str) -> int:
-    """Rough token count, roughly 3 chars per token for mixed en/zh content."""
-    return len(text) // 3
+    cjk = len(_CJK_RE.findall(text))
+    rest = len(text) - cjk
+    dense = rest > 0 and len(_SYMBOL_RE.findall(text)) / len(text) > 0.25
+    return math.ceil(cjk / 1.5) + int(rest / (2.8 if dense else 3.4))
 ```
 
-它不准，真要准得上 tokenizer。但压缩判断要的不是精确值，是「现在大概到几成了」这个量级感，除以 3 对中英混合内容够用了，而且零依赖、零开销。在「够用就好」和「精确但重」之间，这里明确选了前者。什么地方该糙、什么地方该较真，是工程品味的一部分。
+它依然不是 provider tokenizer 的精确计数，所以额外保留窗口的 5%（小窗口至少 64 token）作为安全余量。这里的取舍是：不引入 provider 专属 tokenizer，但把最容易低估的中文、代码、Tool Schema 和协议开销显式算进去，再用硬适配保证估算值不会越界。
 
 ## 第一层：旧的工具输出，是有保质期的
 
-第一层 `_snip_tool_outputs` 是最便宜的，不调模型，纯文本处理。它把超过 1500 字符的工具结果，截成只留头三行和尾三行：
+第一层 `_snip_tool_outputs` 是最便宜的，不调模型，纯文本处理。它把超过 1500 字符的旧工具结果压成有界的头尾片段；按字符而不是按行判断，因此一整行的超大 JSON 也能被处理：
 
 ```python
-content = m.get("content", "")
+content = message.get("content", "")
 if len(content) <= 1500:
     continue
-lines = content.splitlines()
-if len(lines) <= 6:
+if message.get("tool_call_id") in protected_tool_call_ids:
     continue
-snipped = (
-    "\n".join(lines[:3])
-    + f"\n... ({len(lines)} lines, snipped to save context) ...\n"
-    + "\n".join(lines[-3:])
-)
-m["content"] = snipped
+message["content"] = _truncate_text(content, 1500, "snipped to save context")
 ```
 
 这一层背后有个我觉得很漂亮的洞察：工具输出是有保质期的。
@@ -135,7 +146,9 @@ def _safe_split(messages: list[dict], keep_recent: int) -> int:
 
 ## 第三层：最后手段
 
-窗口涨到 90%，说明前两层都没压够，第三层 `_hard_collapse` 是急刹车，只保留最后几条消息加一个摘要，其余全部折叠掉。它同样走 `_safe_split` 保证不留孤儿。这层很少触发，它存在的意义是「万一前两层都不够，至少别让 agent 直接撞墙死掉」，宁可丢掉较多上下文，也要让会话活下去。
+消息预算涨到 90%，说明前两层都没压够，第三层 `_hard_collapse` 是急刹车，只保留最后一组完整消息加一个摘要，其余全部折叠掉。它同样走 `_safe_split` 保证不留孤儿。
+
+三层是质量策略，`_fit_to_budget` 则是正确性边界。如果 hard collapse 后仍超预算，它会依次把陈旧 Tool Result 压到 500 字符、压缩 assistant `tool_calls` 里的超大参数、必要时把尚未消费的结果压到 700 字符，最后才用一条包含最新用户请求、可恢复状态和最新 observations 的 emergency state 替换不可约历史。若连固定的 system prompt、Tool Schema、输出预留和安全余量都已经塞满窗口，则直接抛出 `ContextOverflowError`，而不是发送一个注定会被 provider 拒绝的请求。
 
 ## 和 Claude Code 的对照
 
@@ -147,7 +160,9 @@ def _safe_split(messages: list[dict], keep_recent: int) -> int:
 
 - 上下文窗口是 agent 最硬的物理约束，编码任务又极其能产 token，撞墙是迟早的事。
 - 压缩要分层、从轻到重、惰性触发：能用纯文本截断省出来的，就别动用 LLM 摘要。
+- 预算要覆盖完整请求，而不只是 conversation：system prompt、Tool Schema、协议开销和输出预留都必须计入。
 - 工具输出有保质期，陈旧的输出是优先压缩对象。新鲜信息值钱，陈旧信息廉价。
+- 最新 Tool Result 应至少被模型完整消费一次；启发式压缩之后还需要一个保证请求能放进窗口的硬后置条件。
 - 孤儿 tool 消息是个典型的隐蔽 bug：它依赖一条跨消息的不变式，平时不发作，只在切分点落在工具调用中间时炸。把这种不变式写成测试钉死，是对抗这类 bug 的正道。
 - 压缩是有损的，agent「忘事」是它的固有代价。好策略不是不丢，是丢得聪明。
 

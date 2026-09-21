@@ -4,6 +4,7 @@ The fake server is a stdlib-only Python script run via sys.executable, so
 these tests need no shell and run the same on Windows.
 """
 
+import concurrent.futures
 import json
 import logging
 import sys
@@ -17,6 +18,7 @@ from corecoder.hooks import Hooks
 from corecoder.llm import LLMResponse, ToolCall
 from corecoder.mcp import MCPError, load_mcp_tools
 from corecoder.permissions import Permission
+from corecoder.tools.base import ToolEffect
 
 FAKE_SERVER = """
 import json, os, sys, time
@@ -102,6 +104,7 @@ def test_handshake_registers_each_remote_tool(mcp_config):
         "mcp__fake__echo", "mcp__fake__crash", "mcp__fake__stall", "mcp__fake__fail"}
     echo = next(t for t in tools if t.name == "mcp__fake__echo")
     assert echo.description == "Echo text back"
+    assert echo.effect == ToolEffect.UNKNOWN
     assert echo.schema()["function"]["parameters"]["properties"]["text"] == {"type": "string"}
 
 
@@ -116,16 +119,15 @@ def test_call_round_trip_returns_text_content(mcp_config):
     assert result["role"] == "tool" and result["content"] == "echo: hi"
 
 
-def test_parallel_calls_to_one_server_dont_cross_wires(mcp_config):
-    agent = _agent(
-        [LLMResponse(tool_calls=[_echo_call("c1", "one"), _echo_call("c2", "two")]),
-         LLMResponse(content="done")],
-        load_mcp_tools(mcp_config),
-    )
+def test_parallel_client_calls_to_one_server_dont_cross_wires(mcp_config):
+    echo = next(t for t in load_mcp_tools(mcp_config) if t.name == "mcp__fake__echo")
 
-    assert agent.chat("go") == "done"
-    results = {m["tool_call_id"]: m["content"] for m in agent.messages if m["role"] == "tool"}
-    assert results == {"c1": "echo: one", "c2": "echo: two"}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        one = pool.submit(echo.execute, text="one")
+        two = pool.submit(echo.execute, text="two")
+
+    assert one.result() == "echo: one"
+    assert two.result() == "echo: two"
 
 
 def test_server_crash_mid_call_fails_without_killing_the_loop(mcp_config):

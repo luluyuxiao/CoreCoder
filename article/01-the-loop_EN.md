@@ -2,7 +2,7 @@
 
 If I had only one sentence to explain a coding agent, I'd put it like this: it's a loop that keeps asking the model "what's next," does what the model says, reports the result back to the model, and repeats until the model says "no need to act, I have the answer."
 
-It sounds almost disappointingly plain. But that is the truth of it. Claude Code took this same thing and built it out to hundreds of thousands of lines, yet the most central piece, the part public teardowns call `query.ts`, is at its core a `while` loop of around seventeen hundred lines. CoreCoder writes the same loop in `corecoder/agent.py`, 150 lines including blanks and comments. The two have an identical shape; the only difference is you can read the latter in a single glance.
+It sounds almost disappointingly plain. But that is the truth of it. Claude Code took this same thing and built it out to hundreds of thousands of lines, yet the most central piece, the part public teardowns call `query.ts`, is at its core a `while` loop of around seventeen hundred lines. CoreCoder writes the same loop and scheduling boundary in the 263 lines of `corecoder/agent.py`. The two have an identical shape; the latter can still be read straight through.
 
 In this piece we read that loop closely, section by section.
 
@@ -138,9 +138,9 @@ This code isn't complicated, but it represents an important kind of engineering 
 
 ## Compared with Claude Code
 
-Put CoreCoder's 150 lines next to Claude Code's `query.ts` and you'll find the loop's skeleton almost overlaps: assemble messages, call the model with tools, execute when the model wants tools, backfill the results, loop again, and finish when the model returns text. This structure isn't something CoreCoder copied; it's the shared paradigm of this generation of coding agents, and anyone writing one ends up here.
+Put CoreCoder's loop next to Claude Code's `query.ts` and you'll find the skeleton almost overlaps: assemble messages, call the model with tools, execute when the model wants tools, backfill the results, loop again, and finish when the model returns text. This structure isn't something CoreCoder copied; it's the shared paradigm of this generation of coding agents, and anyone writing one ends up here.
 
-The real difference is the ring of protection around the loop. Claude Code's loop is wrapped in a far thicker layer of error recovery: back off and retry on rate limits, auto-compress and retry when context overflows, switch to a fallback model on a server-side 529, retry a few times when output gets truncated, plus finer budget control (counting both rounds and dollars). CoreCoder splits these out elsewhere: retry lives in [`llm.py`](03-llm-and-cost_EN.md), compression in [`context.py`](04-context_EN.md), and the budget is this file's `max_rounds`. Same shape, different thickness. The next several pieces in this series basically fill that protective ring back in, one layer at a time, showing what each layer is inside Claude Code and what it gets compressed into in CoreCoder.
+The real difference is the ring of protection around the loop. Claude Code's loop is wrapped in a far thicker layer of error recovery: back off and retry on rate limits, auto-compress and retry when context overflows, switch to a fallback model on a server-side 529, retry truncated output, and apply finer budgets. CoreCoder splits these out elsewhere: retry, the fallback chain, and the USD budget live in [`llm.py`](03-llm-and-cost_EN.md), compression lives in [`context.py`](04-context_EN.md), and this file's `max_rounds` separately caps tool-loop iterations. Same shape, different thickness. The next pieces fill that protective ring back in one layer at a time, showing what each layer becomes in a minimal implementation.
 
 ## Wrapping up
 

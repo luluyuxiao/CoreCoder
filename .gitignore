@@ -12,6 +12,7 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .corecoder_history
+.corecoder/
 .DS_Store
 .pytest_cache/
 .tmp/

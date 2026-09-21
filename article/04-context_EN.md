@@ -4,71 +4,82 @@ An agent has one physical constraint it can't get around: the context window is 
 
 And coding tasks happen to be prolific token producers. The model reads a thousand-line file, and those thousand lines, line numbers and all, go into the history; it runs a test, and several hundred lines of output go into the history; it greps once, and dozens of matches go into the history. A halfway-decent task running a dozen-odd rounds burns tens of thousands of tokens. Once the window fills, either the API errors or you have to cut the history, and cut it badly and the agent starts "forgetting": a file it read earlier it reads again, a decision it just made it overturns.
 
-So fitting a long task into a finite window is one of the most hardcore subproblems in agent engineering. This piece looks at how `corecoder/context.py` (210 lines) solves it.
+So fitting a long task into a finite window is one of the most hardcore subproblems in agent engineering. This piece looks at how `corecoder/context.py` (431 lines) solves it.
+
+First, clear up a common misconception: the context-window limit does not apply to `messages` alone. The dynamic system prompt, tool schemas, and protocol framing all consume input tokens, and the model still needs room to generate its answer. Looking only at chat history badly overstates the usable space when the tool set or system prompt is large.
 
 ## Layered, lightest to heaviest
 
-Claude Code's strategy is four layers in public teardowns, escalating from the cheapest handling to the most aggressive. CoreCoder distills it to three, same idea: space you can save with a cheap means, never spend an expensive means on. The three layers only trigger once the window hits certain proportions:
+Claude Code's strategy is four layers in public teardowns, escalating from the cheapest handling to the most aggressive. CoreCoder distills it to three, same idea: space you can save with a cheap means, never spend an expensive means on. The thresholds apply to the budget actually left for conversation history:
 
 ```python
-self._snip_at = int(max_tokens * 0.50)      # 50% -> snip bloated tool outputs
-self._summarize_at = int(max_tokens * 0.70)  # 70% -> LLM-summarize old conversation
-self._collapse_at = int(max_tokens * 0.90)   # 90% -> hard collapse, last resort
+message_budget = (
+    max_tokens
+    - fixed_tokens       # system prompt + tool schemas + request framing
+    - output_reserve     # room for this round's completion
+    - safety_margin      # estimator slack
+)
+snip_at = int(message_budget * 0.50)
+summarize_at = int(message_budget * 0.70)
+collapse_at = int(message_budget * 0.90)
 ```
 
-`maybe_compress` is the dispatcher. It first estimates how many tokens are currently used, then applies each layer on demand from light to heavy, re-estimating after each, and stops once it's enough:
+`Agent.compress_context()` recomputes the system prompt and tool schemas before each LLM round, uses `estimate_request_tokens()` for fixed overhead, and gives the remaining budget to `ContextManager.maybe_compress()`. Plan mode, todo state, the tool set, and output limits can therefore change the budget dynamically.
+
+`maybe_compress` applies the three quality-preserving layers from lightest to heaviest. Its final `_fit_to_budget` is a hard postcondition, not just a heuristic:
 
 ```python
-def maybe_compress(self, messages, llm=None) -> bool:
+def maybe_compress(
+    self, messages, llm=None, *,
+    fixed_tokens=0, output_reserve=0,
+    protected_tool_call_ids=None,
+) -> bool:
+    budget = self.available_message_tokens(fixed_tokens, output_reserve)
     current = estimate_tokens(messages)
-    compressed = False
 
-    if current > self._snip_at:
-        if self._snip_tool_outputs(messages):
-            compressed = True
-            current = estimate_tokens(messages)
+    if current > int(budget * 0.50):
+        self._snip_tool_outputs(messages, protected_tool_call_ids)
+        current = estimate_tokens(messages)
 
-    if current > self._summarize_at and len(messages) > 10:
-        if self._summarize_old(messages, llm, keep_recent=8):
-            compressed = True
-            current = estimate_tokens(messages)
+    if current > int(budget * 0.70) and len(messages) > 10:
+        self._summarize_old(messages, llm, keep_recent=8)
+        current = estimate_tokens(messages)
 
-    if current > self._collapse_at and len(messages) > 4:
+    if current > int(budget * 0.90) and len(messages) > 4:
         self._hard_collapse(messages, llm)
-        compressed = True
 
-    return compressed
+    if estimate_tokens(messages) > budget:
+        self._fit_to_budget(messages, budget, protected_tool_call_ids)
+
+    if estimate_tokens(messages) > budget:
+        raise ContextOverflowError(...)
 ```
 
-Those two `self.context.maybe_compress(...)` calls in the previous pieces call into here. It fires before every request and after every round of tool execution, but the overwhelming majority of the time the window isn't full and the function does nothing and returns. Compression is lazy, spending effort only when about to hit the wall.
+Compression runs immediately before each LLM request. Tool execution does not instantly snip its own result: at the start of the next round, the Agent marks those `tool_call_id`s as unconsumed, and ordinary snipping skips them. Protection is cleared only after one LLM request returns successfully. Fresh Tool Results therefore get at least one chance to reach the model intact. If the fresh batch itself cannot fit, the final fitting step bounds it as an explicitly marked observation rather than sending an impossible request.
 
-As for how tokens get estimated, `estimate_tokens` uses a method crude to the point of being endearing: character count divided by 3.
+Token estimation remains dependency-free, but it is no longer one flat characters-per-token ratio. `_approx_tokens` treats CJK, symbol-dense code, and ordinary prose separately; `estimate_tokens` includes per-message framing, `tool_calls`, and `tool_call_id`, while `estimate_tool_schema_tokens` covers schemas:
 
 ```python
 def _approx_tokens(text: str) -> int:
-    """Rough token count, roughly 3 chars per token for mixed en/zh content."""
-    return len(text) // 3
+    cjk = len(_CJK_RE.findall(text))
+    rest = len(text) - cjk
+    dense = rest > 0 and len(_SYMBOL_RE.findall(text)) / len(text) > 0.25
+    return math.ceil(cjk / 1.5) + int(rest / (2.8 if dense else 3.4))
 ```
 
-It's not accurate; for real accuracy you'd bring in a tokenizer. But the compression decision doesn't need an exact value, it needs a sense of "roughly what fraction are we at," and dividing by 3 is good enough for mixed English/Chinese content, plus it's zero-dependency, zero-overhead. Between "good enough" and "precise but heavy," it clearly chose the former here. Where to be crude and where to be exacting is part of engineering taste.
+This still is not a provider tokenizer, so CoreCoder reserves 5% of the window (at least 64 tokens for small test windows) as estimator slack. The tradeoff is deliberate: avoid provider-specific tokenizers, explicitly account for the common underestimation traps, and use deterministic fitting as the final safety boundary.
 
 ## Layer one: old tool outputs have a shelf life
 
-The first layer, `_snip_tool_outputs`, is the cheapest, calling no model, pure text processing. It snips tool results over 1500 characters down to just the first three and last three lines:
+The first layer, `_snip_tool_outputs`, is the cheapest, calling no model, pure text processing. It bounds stale tool results over 1500 characters to useful head and tail text. The check is character-based, so one giant line of JSON is handled too:
 
 ```python
-content = m.get("content", "")
+content = message.get("content", "")
 if len(content) <= 1500:
     continue
-lines = content.splitlines()
-if len(lines) <= 6:
+if message.get("tool_call_id") in protected_tool_call_ids:
     continue
-snipped = (
-    "\n".join(lines[:3])
-    + f"\n... ({len(lines)} lines, snipped to save context) ...\n"
-    + "\n".join(lines[-3:])
-)
-m["content"] = snipped
+message["content"] = _truncate_text(content, 1500, "snipped to save context")
 ```
 
 Behind this layer is an insight I find rather beautiful: tool output has a shelf life.
@@ -135,7 +146,9 @@ This trap is worth remembering, because it has every feature of a "hidden bug": 
 
 ## Layer three: the last resort
 
-When the window climbs to 90%, it means the first two layers didn't compress enough, and layer three `_hard_collapse` is the emergency brake: keep only the last few messages plus a summary, collapse everything else. It likewise goes through `_safe_split` to guarantee no orphans. This layer rarely fires; its reason to exist is "in case the first two layers aren't enough, at least don't let the agent hit the wall and die outright," preferring to discard more context to keep the session alive.
+When the message budget climbs to 90%, layer three `_hard_collapse` is the emergency brake: keep one complete recent group plus a summary and collapse everything else. It likewise goes through `_safe_split` to guarantee no orphans.
+
+Those three layers are a quality strategy; `_fit_to_budget` is the correctness boundary. If history remains too large, it bounds stale Tool Results to 500 characters, compacts oversized assistant tool-call arguments, bounds unconsumed results to 700 characters only if necessary, and finally replaces irreducible history with one emergency state carrying the latest user request, recoverable state, and latest observations. If the fixed system prompt, schemas, output reserve, and safety margin already fill the entire window, `ContextOverflowError` is raised instead of sending a request the provider must reject.
 
 ## Compared with Claude Code
 
@@ -147,7 +160,9 @@ This piece also answers a question from the opening: why does an agent occasiona
 
 - The context window is the agent's hardest physical constraint, and coding tasks are prolific token producers, so hitting the wall is only a matter of time.
 - Compression should be layered, lightest to heaviest, lazily triggered: what you can save with pure-text truncation, don't spend an LLM summary on.
+- Budget the complete request, not just the conversation: system prompt, tool schemas, protocol framing, and output reserve all count.
 - Tool output has a shelf life, and stale output is the priority compression target. Fresh information is valuable, stale information is cheap.
+- A fresh Tool Result should reach the model intact at least once; heuristic compression still needs a hard postcondition that the request fits.
 - The orphaned tool message is a textbook hidden bug: it depends on a cross-message invariant, doesn't act up normally, and only blows up when the cut point lands in the middle of a tool call. Nailing this kind of invariant down as a test is the right way to fight this class of bug.
 - Compression is lossy, and an agent "forgetting" is its inherent cost. A good strategy isn't losing nothing, it's losing smart.
 

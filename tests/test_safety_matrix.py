@@ -123,8 +123,8 @@ def test_post_hook_observes_only_calls_that_actually_executed(tmp_path):
     assert "b.txt" in observed
 
 
-def test_plan_mode_parallel_batch_refuses_writes_but_runs_reads(tmp_path):
-    """Plan mode inside a parallel batch: the read executes, the write is
+def test_plan_mode_multi_call_batch_refuses_writes_but_runs_reads(tmp_path):
+    """Plan mode inside a multi-call batch: the read executes, the write is
     refused, and both answers land on their own call ids."""
     (tmp_path / "note.txt").write_text("hello\n", encoding="utf-8")
     agent = Agent(

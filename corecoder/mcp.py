@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from . import __version__
-from .tools.base import Tool
+from .tools.base import Tool, ToolEffect
 
 log = logging.getLogger(__name__)
 
@@ -39,8 +39,8 @@ class MCPClient:
     """One stdio server process: handshake, list, call, shut down.
 
     A daemon thread owns stdout and parks each response under its request id,
-    so calls from parallel tool execution match their own replies; the write
-    lock keeps two threads' requests from interleaving on stdin.
+    so calls from parallel clients match their own replies; the write lock
+    keeps two threads' requests from interleaving on stdin.
     """
 
     def __init__(self, name: str, command: str, args: list = (), env: dict | None = None):
@@ -164,6 +164,8 @@ class MCPTool(Tool):
     never collide with a built-in. Side effects are unknown, so it stays out of
     Permission.READ_ONLY and the consent gate asks first, like any mutating tool.
     """
+
+    effect = ToolEffect.UNKNOWN
 
     def __init__(self, client: MCPClient, spec: dict):
         self._client = client

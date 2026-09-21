@@ -13,7 +13,8 @@ import subprocess
 import threading
 from typing import ClassVar
 
-from .base import Tool
+from ..sandbox import CommandExecutor, LocalCommandExecutor, SandboxViolation
+from .base import Tool, ToolEffect
 
 # Track cwd across commands (Claude Code does this too). Thread-local, so that
 # when the agent executes tools in parallel two bash calls never race on one
@@ -40,6 +41,7 @@ _DANGEROUS_PATTERNS = [
 
 class BashTool(Tool):
     name = "bash"
+    effect = ToolEffect.EXTERNAL
     description = (
         "Execute a shell command. Returns stdout, stderr, and exit code. "
         "Use this for running tests, installing packages, git operations, etc."
@@ -59,6 +61,19 @@ class BashTool(Tool):
         "required": ["command"],
     }
 
+    def __init__(self, executor: CommandExecutor | None = None):
+        self.executor = executor or LocalCommandExecutor()
+        # Cwd is isolated both by BashTool instance and by worker thread.  This
+        # prevents separate Agents in the same Python process from inheriting
+        # one another's last `cd`, while retaining safe parallel tool calls.
+        self._local = threading.local()
+        if self.executor.mode == "docker":
+            self.description = (
+                type(self).description
+                + " Commands run in an isolated Docker container; the project root is /workspace "
+                "and is the only host directory mounted. Prefer relative paths."
+            )
+
     def execute(self, command: str, timeout: int = 120) -> str:
         # safety check
         warning = _check_dangerous(command)
@@ -66,24 +81,21 @@ class BashTool(Tool):
             return f"⚠ Blocked: {warning}\nCommand: {command}\nIf intentional, modify the command to be more specific."
 
         # use this thread's own tracked working directory
-        cwd = getattr(_local, "cwd", None) or os.getcwd()
+        default_cwd = getattr(self.executor, "workspace_root", None) or os.getcwd()
+        cwd = getattr(self._local, "cwd", None) or str(default_cwd)
 
         try:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                cwd=cwd,
-            )
+            proc = self.executor.run(command, cwd=cwd, timeout=timeout)
 
             # track cd commands so next command runs in the right place
             if proc.returncode == 0:
-                _update_cwd(command, cwd)
+                _update_cwd(
+                    command,
+                    cwd,
+                    getattr(self.executor, "workspace_root", None),
+                    getattr(self.executor, "container_workspace", None),
+                    self._local,
+                )
             out = proc.stdout
             if proc.stderr:
                 out += f"\n[stderr]\n{proc.stderr}"
@@ -99,6 +111,8 @@ class BashTool(Tool):
             return out.strip() or "(no output)"
         except subprocess.TimeoutExpired:
             return f"Error: timed out after {timeout}s"
+        except SandboxViolation as e:
+            return f"Sandbox violation: {e}"
         except Exception as e:  # noqa: BLE001
             # anything else from the OS (spawn failure etc.) also comes back as text
             return f"Error running command: {e}"
@@ -112,8 +126,15 @@ def _check_dangerous(cmd: str) -> str | None:
     return None
 
 
-def _update_cwd(command: str, current_cwd: str):
+def _update_cwd(
+    command: str,
+    current_cwd: str,
+    workspace_root=None,
+    container_workspace=None,
+    state=None,
+):
     """Track directory changes from cd commands, per thread."""
+    state = state or _local
     # walk each cd in a && chain, resolving relative targets against the dir the
     # previous cd landed in (not the original cwd) so `cd a && cd b` ends in a/b.
     # a parenthesized group is a subshell — `( cd a )` never changes this shell's
@@ -126,9 +147,23 @@ def _update_cwd(command: str, current_cwd: str):
         if part.startswith("cd "):
             target = part[3:].strip().strip("'\"")
             if target:
+                # Docker commands see the host workspace as /workspace. Map
+                # that path back before persisting cwd for the next invocation.
+                if workspace_root is not None and container_workspace is not None:
+                    container_root = str(container_workspace)
+                    if target == container_root or target.startswith(container_root + "/"):
+                        suffix = target[len(container_root) :].lstrip("/")
+                        target = os.path.join(str(workspace_root), suffix)
                 new_dir = os.path.normpath(os.path.join(running, os.path.expanduser(target)))
                 if os.path.isdir(new_dir):
                     running = new_dir
                     changed = True
     if changed:
-        _local.cwd = running
+        if workspace_root is not None:
+            root = os.path.realpath(workspace_root)
+            try:
+                if os.path.commonpath([root, os.path.realpath(running)]) != root:
+                    return
+            except ValueError:
+                return
+        state.cwd = running

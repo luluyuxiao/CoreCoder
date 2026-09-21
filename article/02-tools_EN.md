@@ -4,11 +4,11 @@ In the loop from the last piece, one step got glossed over: executing tools. Thi
 
 The model itself does only one thing, emitting the next text given the text so far. It can't read your files, can't run your tests, can't write a single byte to disk. What turns it from "able to talk" into "able to do" is tools. A tool is the hand through which an agent actually touches the world. So how strong an agent is depends largely on how well its tools are designed: whether the interface is clear, whether the error feedback lands, whether dangerous operations get stopped.
 
-CoreCoder gives the model seven tools: `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `agent`. In this piece we first look at the skeleton they share, then dig into the two most worth discussing, and finally I'll have you write one of your own.
+CoreCoder gives the model eleven tools by default: `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `todo_write`, `agent`, `agent_status`, `fetch_url`, and `now`. In this piece we first look at the skeleton they share, then dig into the two most worth discussing, and finally I'll have you write one of your own.
 
 ## What a tool looks like
 
-Every tool inherits from `Tool` in `tools/base.py`, the whole base class being 27 lines:
+Every tool inherits from `Tool` in `tools/base.py`, with effect metadata defined in the same small file:
 
 ```python
 class Tool(ABC):
@@ -17,6 +17,7 @@ class Tool(ABC):
     name: str
     description: str
     parameters: dict  # JSON Schema for the function args
+    effect: str = ToolEffect.UNKNOWN
 
     @abstractmethod
     def execute(self, **kwargs) -> str:
@@ -33,31 +34,32 @@ class Tool(ABC):
                 "parameters": self.parameters,
             },
         }
+
+    def is_concurrency_safe(self) -> bool:
+        return self.effect in {ToolEffect.PURE, ToolEffect.READ}
 ```
 
-A tool is four things: a name, a description for the model to read, a JSON Schema describing the parameters, and an `execute` that does the actual work. `schema()` assembles the first three into the shape OpenAI function calling wants and sends it to the model, which decides from it whether to call and how to fill the arguments.
+A tool's LLM-facing interface remains four things: a name, a description, a parameter JSON Schema, and the `execute` implementation. The extra `effect` is local scheduler metadata and is not sent in the model schema. It decides whether approved calls may overlap: `PURE/READ` calls can join a read batch, while `WRITE/EXTERNAL/UNKNOWN` calls run serially.
 
 There's a design choice here worth one remark. CoreCoder has no tool inheritance hierarchy, no `FileTool` deriving `ReadTool` deriving whatever. Each tool is a direct subclass of `Tool`, minding its own business. Claude Code goes further: in public teardowns it doesn't use class inheritance at all, but a `buildTool()` factory function that takes name, schema, execution logic, and permission check as configuration and assembles a tool object. Both rest on the same judgment: tools share little genuinely common behavior, and forcing inheritance only adds coupling. Composition over inheritance shows up especially cleanly here.
 
-Registering a tool is just as plain, a list in `tools/__init__.py`:
+Registering a tool is just as plain: `build_tools()` in `tools/__init__.py` returns a list of instances:
 
 ```python
-ALL_TOOLS = [
-    BashTool(),
-    ReadFileTool(),
-    WriteFileTool(),
-    EditFileTool(),
-    GlobTool(),
-    GrepTool(),
-    AgentTool(),
-]
+def build_tools(...):
+    return [
+        BashTool(),
+        ReadFileTool(),
+        # ...the remaining tools...
+        AgentTool(),
+    ]
 ```
 
 To add a tool, drop an instance into this list. We'll actually do that at the end of this piece.
 
 ## edit_file: a key innovation that looks unremarkable
 
-If I could only discuss one of the seven tools, I'd pick `edit_file`. Because "let the model modify an existing file," a need that looks simple, has several dead bodies behind it.
+If I could only discuss one of these tools, I'd pick `edit_file`. Because "let the model modify an existing file," a need that looks simple, has several dead bodies behind it.
 
 The first dead end is having the model patch by line number, say "replace line 42 with this." The problem is the model's sense of line numbers is wildly unreliable; the line 42 in its head and the real line 42 in the file often don't match, and being off by one means editing the wrong place. Worse, the moment something earlier in the file gets touched, every line number after it shifts.
 
@@ -115,7 +117,7 @@ Without this check, the moment the model accidentally runs `edit_file` on a bina
 
 Tools like `read_file` and `edit_file` can only do limited damage. `bash` is different; it runs arbitrary shell commands, and the moment the model writes `rm -rf /`, the consequences are real.
 
-Claude Code's `BashTool` is 1,143 lines in public teardowns, with a command classifier, a real sandbox built on `sandbox-exec` and `seccomp`, output truncation, and interactive-command interception. CoreCoder's `bash.py` is a 127-line distillation that keeps the four most essential things: dangerous-command detection, output truncation, timeout, and working-directory tracking.
+Claude Code's `BashTool` is 1,143 lines in public teardowns, with a command classifier, a real sandbox built on `sandbox-exec` and `seccomp`, output truncation, and interactive-command interception. CoreCoder's original `bash.py` was a 127-line distillation that kept dangerous-command detection, output truncation, timeout, and working-directory tracking. The current source adds an optional Docker execution backend around it; this section first explains the regex gate that still applies, especially in the default `local` mode.
 
 Dangerous-command detection is a regex blocklist:
 
@@ -141,7 +143,7 @@ if warning:
 
 I want to say a bit more about those two `rm` regexes, because they show whether the person writing a blocklist actually thought about the adversary. The first targets "recursive delete aimed at root or home," and note the force flag is written as optional, because `rm -r /` without `-f` is just as dangerous. The second uses two lookahead assertions requiring both `-r` (or `-R`) and `-f` to appear in the command, regardless of their order and spelling. That's because `rm -rf`, `rm -fr`, `rm -r -f`, `rm -f -r` are four spellings of the same thing, and a naive literal match on `rm -rf` would miss the latter three. The test `test_bash_blocks_rm_force_recursive_variants` feeds these variants, along with the long-form `--recursive --force`, in one by one and verifies each gets blocked. At the same time it must let through a normal `rm -f notes.log` or `rm -r ./build_output`, without swinging the bat at every `rm`.
 
-Here a boundary needs drawing clearly: **this blocklist is not a security boundary, it's just a guard against slips of the hand.** A regex blocklist inherently can't stop a determined adversary; a command can be base64-encoded, assembled from variables, evaded a hundred ways. What it can stop is the most common, most direct catastrophe command the model generates in a moment of confusion; it can't stop deliberate attack. The reason Claude Code reaches for a kernel-level sandbox like `seccomp` is precisely that the blocklist road is a dead end for security. CoreCoder choosing a blocklist is a clear tradeoff between teaching clarity and real security: it lets you see at a glance what the "dangerous-operation interception" design point looks like, but it doesn't pretend to be a production-grade security scheme. If you take CoreCoder into an untrusted use case, a sandbox is the lesson you must supply yourself. [Piece seven](07-build-your-own_EN.md) comes back to this.
+Here a boundary needs drawing clearly: **this blocklist is not a security boundary, it's just a guard against slips of the hand.** A regex blocklist inherently can't stop a determined adversary; a command can be base64-encoded, assembled from variables, and evaded a hundred ways. The current source therefore offers `--sandbox docker`: each bash command enters a disposable container with networking disabled by default, a read-only root filesystem, dropped capabilities, and only the startup directory mounted at `/workspace`. The regex remains as defense in depth; default `local` mode still has only the slip guard. The container boundary also covers bash only—hooks, MCP servers, and `fetch_url` remain host-side—so this is an honest minimum security baseline, not a claim of complete production isolation.
 
 The other two things deserve a passing mention. Output truncation keeps head and tail: when a command spews tens of thousands of lines, only the first 6000 and last 3000 characters are kept, with one line of explanation standing in for the middle, which neither blows up the context nor loses the most useful opening and ending. Working-directory tracking lets `cd` be remembered across commands, and `_update_cwd` specially handles chained jumps like `cd a && cd b`, resolving b relative to a rather than relative to the starting point (the test `test_bash_chained_cd_resolves_sequentially` watches it). These are small pits that "running commands" throws up in real use, filled in one by one.
 
@@ -161,7 +163,7 @@ The second is hooks. `~/.corecoder/hooks.json` lets users hang shell commands on
 
 The third is MCP. In `mcp.py`, each server is a subprocess speaking newline-delimited JSON-RPC over stdio: handshake, `tools/list`, and then every remote tool registers as `mcp__server__tool`, after which consent, hooks, and plan mode treat it exactly like the built-ins. The lesson is where that "exactly like" comes from: not from special-casing in the MCP code, but from a tool boundary (the `Tool` base class plus the three gates) clean enough that an external tool is just one more implementation. A wedged or dead server costs one error string on that one call; the loop keeps turning.
 
-All three are advanced pieces. They are not on the agent's skeleton — the skeleton is still the loop plus seven tools. But they answer the same question: around a tool call, who else gets to speak? The answer went from "two gates" to "two gates plus a ring of pluggable bypasses," and every bypass is designed to fail without dragging the main loop down with it.
+All three are advanced pieces. They do not change the agent-loop skeleton. But they answer the same question: around a tool call, who else gets to speak? The answer went from "two gates" to "two gates plus a ring of pluggable bypasses," and every bypass is designed to fail without dragging the main loop down with it.
 
 ## Hands-on: write your first tool
 
@@ -171,11 +173,12 @@ After all that talk, better to actually add one. Suppose we want to give the age
 """A tool that tells the agent the current time."""
 
 import time
-from .base import Tool
+from .base import Tool, ToolEffect
 
 
 class NowTool(Tool):
     name = "now"
+    effect = ToolEffect.PURE
     description = "Get the current local date and time. Use this when the user asks about the current time or you need a timestamp."
     parameters = {
         "type": "object",
@@ -187,16 +190,17 @@ class NowTool(Tool):
         return time.strftime("%Y-%m-%d %H:%M:%S")
 ```
 
-Then register it in `tools/__init__.py`:
+Then register it in `build_tools()` in `tools/__init__.py`:
 
 ```python
 from .now import NowTool
 
-ALL_TOOLS = [
-    BashTool(),
-    # ...the existing tools...
-    NowTool(),
-]
+def build_tools(...):
+    return [
+        BashTool(),
+        # ...the existing tools...
+        NowTool(),
+    ]
 ```
 
 That's it. No other steps. Re-run `corecoder`, ask it "what time is it," and you'll see it call `now`, then answer you with the result.
@@ -210,7 +214,7 @@ The whole tool system's extensibility is concentrated in those few steps: define
 - Tools are the agent's hand on the world, and how well they're designed directly sets the ceiling on the agent's ability.
 - `edit_file`'s "unique search and replace" is the key innovation: with the constraint "the original text must be unique across the file," it turns the unreliable act of editing a file into a determinate operation, and even its error message teaches the model how to get the edit right.
 - Having the model generate a diff is unreliable; having the tool generate a diff for the model to read is perfectly reliable. Generation and consumption each in their place.
-- bash's regex blocklist is a guard against slips of the hand, not a security boundary. To truly face untrusted scenarios, you supply the sandbox yourself. Getting this clear matters more than pretending to be secure.
+- bash's regex blocklist is only a slip guard; the optional Docker backend is the execution boundary. It isolates bash, not hooks, MCP servers, or `fetch_url`, and that scope must remain explicit.
 - Adding a tool costs almost nothing: one class plus one line of registration. That's where the agent's extensibility comes from.
 
 Next piece, we look at the brain behind this hand, and how to plug in any provider's model while getting the bill right along the way.

@@ -1,5 +1,6 @@
 """Tests for core modules: config, context, session, imports."""
 
+import copy
 import re
 from pathlib import Path
 from typing import ClassVar
@@ -8,9 +9,26 @@ from unittest import mock
 import pytest
 from openai import BadRequestError
 
-from corecoder import ALL_TOOLS, LLM, Agent, Config, __version__
+from corecoder import (
+    ALL_TOOLS,
+    LLM,
+    Agent,
+    BudgetExceededError,
+    Config,
+    JsonlTrace,
+    MemoryTrace,
+    TraceSink,
+    __version__,
+)
+from corecoder import ContextOverflowError as PublicContextOverflowError
 from corecoder import session as session_module
-from corecoder.context import ContextManager, estimate_tokens
+from corecoder.context import (
+    ContextManager,
+    ContextOverflowError,
+    estimate_request_tokens,
+    estimate_tokens,
+)
+from corecoder.llm import LLMResponse, ToolCall
 from corecoder.session import list_sessions, load_session, save_session
 from tests.conftest import get_tool
 
@@ -58,8 +76,13 @@ def test_public_api_exports():
     """Users should be able to import key classes from the top-level package."""
     assert Agent is not None
     assert LLM is not None
+    assert BudgetExceededError is not None
     assert Config is not None
-    assert len(ALL_TOOLS) == 8
+    assert PublicContextOverflowError is ContextOverflowError
+    assert TraceSink is not None
+    assert JsonlTrace is not None
+    assert MemoryTrace is not None
+    assert len(ALL_TOOLS) == 11
 
 
 def test_config_from_env(monkeypatch):
@@ -70,13 +93,33 @@ def test_config_from_env(monkeypatch):
 
 def test_config_defaults(monkeypatch):
     # clear relevant env vars without leaking the change into other tests
+    # and isolate the default contract from a developer's real local .env
+    monkeypatch.setattr("corecoder.config._load_dotenv", lambda: None)
     monkeypatch.delenv("CORECODER_MODEL", raising=False)
     monkeypatch.delenv("CORECODER_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("CORECODER_FALLBACK_MODELS", raising=False)
+    monkeypatch.delenv("CORECODER_MAX_COST_USD", raising=False)
+    monkeypatch.delenv("CORECODER_TRACE", raising=False)
+    monkeypatch.delenv("CORECODER_TRACE_CONTENT", raising=False)
 
     c = Config.from_env()
     assert c.model == "gpt-5.5"
     assert c.max_tokens == 4096
     assert c.temperature == 0.0
+    assert c.fallback_models == []
+    assert c.max_cost_usd is None
+    assert c.trace_path is None
+    assert c.trace_content is False
+
+
+def test_config_reads_trace_settings(monkeypatch, tmp_path):
+    path = tmp_path / "trace.jsonl"
+    monkeypatch.setenv("CORECODER_TRACE", str(path))
+    monkeypatch.setenv("CORECODER_TRACE_CONTENT", "true")
+
+    config = Config.from_env()
+    assert config.trace_path == str(path)
+    assert config.trace_content is True
 
 
 # --- Context ---
@@ -114,6 +157,139 @@ def test_context_snip():
     ctx._snip_tool_outputs(msgs)
     after = estimate_tokens(msgs)
     assert after < before
+
+
+def test_context_snips_giant_single_line_tool_output():
+    msgs = [{"role": "tool", "tool_call_id": "t1", "content": "x" * 10_000}]
+
+    assert ContextManager._snip_tool_outputs(msgs)
+    assert len(msgs[0]["content"]) <= 1500
+    assert "snipped to save context" in msgs[0]["content"]
+
+
+def test_request_estimate_includes_tool_schemas():
+    messages = [{"role": "user", "content": "hello"}]
+    small = estimate_request_tokens(messages, [])
+    large = estimate_request_tokens(messages, [{
+        "type": "function",
+        "function": {
+            "name": "large_tool",
+            "description": "x" * 4000,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }])
+
+    assert large > small + 1000
+
+
+def test_context_protects_fresh_tool_result_from_history_snip():
+    ctx = ContextManager(max_tokens=8_000)
+    old = "old\n" * 2_000
+    fresh = "fresh\n" * 1_400
+    msgs = [
+        {"role": "tool", "tool_call_id": "old", "content": old},
+        {"role": "tool", "tool_call_id": "fresh", "content": fresh},
+    ]
+
+    ctx.maybe_compress(msgs, protected_tool_call_ids={"fresh"})
+
+    assert len(msgs[0]["content"]) < len(old)
+    assert msgs[1]["content"] == fresh
+    assert "tool_snip" in ctx.last_actions
+
+
+def test_context_budget_fit_is_a_hard_postcondition():
+    ctx = ContextManager(max_tokens=2_200)
+    fixed_tokens = 400
+    output_reserve = 200
+    huge_args = '{"content":"' + "a" * 10_000 + '"}'
+    msgs = [
+        {"role": "user", "content": "write it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "fresh",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": huge_args},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "fresh", "content": "z" * 10_000},
+    ]
+
+    ctx.maybe_compress(
+        msgs,
+        fixed_tokens=fixed_tokens,
+        output_reserve=output_reserve,
+        protected_tool_call_ids={"fresh"},
+    )
+
+    reserved = (
+        fixed_tokens
+        + output_reserve
+        + ctx.safety_margin_tokens
+        + estimate_tokens(msgs)
+    )
+    assert reserved <= ctx.max_tokens
+    assert "budget_fit" in ctx.last_actions
+
+
+def test_context_rejects_irreducible_fixed_overhead():
+    ctx = ContextManager(max_tokens=1_000)
+
+    with pytest.raises(ContextOverflowError, match="system prompt, tool schemas"):
+        ctx.maybe_compress([], fixed_tokens=800, output_reserve=200)
+
+
+def test_agent_sends_fresh_tool_observation_before_snipping(tmp_path):
+    from corecoder.tools.base import Tool, ToolEffect
+
+    observation = "important middle content\n" * 240
+
+    class LargeRead(Tool):
+        name = "large_read"
+        description = "Return one important bounded observation."
+        effect = ToolEffect.READ
+        parameters: ClassVar[dict] = {
+            "type": "object", "properties": {}, "required": [],
+        }
+
+        def execute(self):
+            return observation
+
+    class RecordingLLM:
+        model = "recording"
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        extra: ClassVar[dict] = {"max_tokens": 128}
+
+        def __init__(self):
+            self.requests = []
+
+        def chat(self, messages, tools=None, on_token=None, on_event=None):
+            self.requests.append(copy.deepcopy(messages))
+            if len(self.requests) == 1:
+                return LLMResponse(tool_calls=[ToolCall(
+                    id="fresh", name="large_read", arguments={},
+                )])
+            return LLMResponse(content="done")
+
+    llm = RecordingLLM()
+    agent = Agent(
+        llm=llm,
+        tools=[LargeRead()],
+        max_context_tokens=4_000,
+        workspace=tmp_path,
+    )
+
+    assert agent.chat("read it") == "done"
+    seen = next(
+        message["content"]
+        for message in llm.requests[1]
+        if message.get("role") == "tool"
+    )
+    assert seen == observation
+    assert not agent._unconsumed_tool_call_ids
 
 
 def test_context_compress():

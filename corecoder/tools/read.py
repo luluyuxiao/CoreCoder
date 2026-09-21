@@ -3,11 +3,13 @@
 from pathlib import Path
 from typing import ClassVar
 
-from .base import Tool
+from ..sandbox import WorkspacePathPolicy
+from .base import Tool, ToolEffect
 
 
 class ReadFileTool(Tool):
     name = "read_file"
+    effect = ToolEffect.READ
     description = (
         "Read a file's contents with line numbers. "
         "Always read a file before editing it."
@@ -31,9 +33,16 @@ class ReadFileTool(Tool):
         "required": ["file_path"],
     }
 
+    def __init__(self, path_policy: WorkspacePathPolicy | None = None):
+        self.path_policy = path_policy
+
     def execute(self, file_path: str, offset: int = 1, limit: int = 2000) -> str:
         try:
-            p = Path(file_path).expanduser().resolve()
+            p = (
+                self.path_policy.resolve(file_path)
+                if self.path_policy
+                else Path(file_path).expanduser().resolve()
+            )
             if not p.exists():
                 return f"Error: {file_path} not found"
             if not p.is_file():

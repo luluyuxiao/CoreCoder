@@ -3,11 +3,13 @@
 from pathlib import Path
 from typing import ClassVar
 
-from .base import Tool
+from ..sandbox import WorkspacePathPolicy
+from .base import Tool, ToolEffect
 
 
 class GlobTool(Tool):
     name = "glob"
+    effect = ToolEffect.READ
     description = (
         "Find files matching a glob pattern. "
         "Supports ** for recursive matching (e.g. '**/*.py')."
@@ -27,15 +29,26 @@ class GlobTool(Tool):
         "required": ["pattern"],
     }
 
+    def __init__(self, path_policy: WorkspacePathPolicy | None = None):
+        self.path_policy = path_policy
+
     def execute(self, pattern: str, path: str = ".") -> str:
         try:
-            base = Path(path).expanduser().resolve()
+            if self.path_policy and (Path(pattern).is_absolute() or ".." in Path(pattern).parts):
+                return "Error: glob pattern may not escape the sandbox workspace"
+            base = (
+                self.path_policy.resolve(path)
+                if self.path_policy
+                else Path(path).expanduser().resolve()
+            )
             if not base.exists():
                 return f"Error: {path} not found"
             if not base.is_dir():
                 return f"Error: {path} is not a directory"
 
             hits = list(base.glob(pattern))
+            if self.path_policy:
+                hits = [hit for hit in hits if self.path_policy.contains(hit)]
             # sort by mtime, newest first
             hits.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
 

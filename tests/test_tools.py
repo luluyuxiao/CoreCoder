@@ -8,7 +8,7 @@ from tests.conftest import get_tool
 
 
 def test_tool_count():
-    assert len(ALL_TOOLS) == 8
+    assert len(ALL_TOOLS) == 11
 
 
 def test_all_tools_have_valid_schema():
@@ -355,6 +355,12 @@ def test_agent_tool_schema():
     s = agent_t.schema()
     assert s["function"]["name"] == "agent"
     assert "task" in s["function"]["parameters"]["properties"]
+    assert s["function"]["parameters"]["properties"]["run_mode"]["enum"] == [
+        "foreground", "background",
+    ]
+    assert s["function"]["parameters"]["properties"]["isolation"]["enum"] == [
+        "shared", "worktree",
+    ]
 
 
 # --- todo_write ---
@@ -434,3 +440,32 @@ def test_todo_write_bad_call_keeps_old_list():
     todo.execute(tasks=[{"content": "keep me", "status": "pending"}])
     todo.execute(tasks=[{"content": "bad", "status": "nope"}])
     assert "keep me" in todo.render()
+
+
+# --- locally extended tools ---
+
+def test_now_returns_local_timestamp(monkeypatch):
+    monkeypatch.setattr("corecoder.tools.now.time.strftime", lambda fmt: "2026-09-19 12:34:56")
+    assert get_tool("now").execute() == "2026-09-19 12:34:56"
+
+
+def test_fetch_url_rejects_non_http_scheme():
+    assert "only http and https" in get_tool("fetch_url").execute("file:///etc/passwd")
+
+
+def test_fetch_url_reads_and_truncates(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, limit):
+            assert limit == 1_000_000
+            return ("a" * 9000).encode()
+
+    monkeypatch.setattr("corecoder.tools.fetch.urllib.request.urlopen", lambda req, timeout: Response())
+    result = get_tool("fetch_url").execute("https://example.test", timeout=3)
+    assert len(result) < 9000
+    assert "truncated, 9000 chars" in result

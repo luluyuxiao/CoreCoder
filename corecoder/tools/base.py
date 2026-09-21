@@ -1,6 +1,22 @@
 """Base class for all tools."""
 
+import threading
 from abc import ABC, abstractmethod
+
+
+class ToolEffect:
+    """Coarse side-effect metadata used by the tool scheduler.
+
+    This is deliberately separate from permissions: permissions decide whether
+    a call is allowed, while effects decide whether two allowed calls may run
+    at the same time.  Unknown tools fail closed and run exclusively.
+    """
+
+    PURE = "pure"
+    READ = "read"
+    WRITE = "write"
+    EXTERNAL = "external"
+    UNKNOWN = "unknown"
 
 
 class Tool(ABC):
@@ -9,6 +25,7 @@ class Tool(ABC):
     name: str
     description: str
     parameters: dict  # JSON Schema for the function args
+    effect: str = ToolEffect.UNKNOWN
 
     @abstractmethod
     def execute(self, **kwargs) -> str:
@@ -25,3 +42,15 @@ class Tool(ABC):
                 "parameters": self.parameters,
             },
         }
+
+    def is_concurrency_safe(self) -> bool:
+        """Whether calls to this tool may share a parallel read batch."""
+        return self.effect in {ToolEffect.PURE, ToolEffect.READ}
+
+    def execution_lock(self):
+        """Per-instance lock for unsafe tools shared by multiple Agents."""
+        lock = getattr(self, "_corecoder_execution_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._corecoder_execution_lock = lock
+        return lock

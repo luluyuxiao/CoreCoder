@@ -106,7 +106,7 @@ def test_slow_hook_times_out_and_is_skipped(tmp_path, caplog, monkeypatch):
     assert any("TimeoutExpired" in r.getMessage() for r in caplog.records)
 
 
-def test_hooks_gate_each_call_of_a_parallel_batch(tmp_path):
+def test_hooks_gate_each_call_of_a_multi_call_batch(tmp_path):
     calls = [
         _write_call("c1", tmp_path / "a.txt"),
         _write_call("c2", tmp_path / "b.txt"),

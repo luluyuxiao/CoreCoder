@@ -109,7 +109,7 @@ def test_allow_all_approves_without_any_callback(tmp_path):
     assert (tmp_path / "a.txt").exists() and (tmp_path / "b.txt").exists()
 
 
-def test_parallel_calls_each_get_their_own_decision(tmp_path):
+def test_multi_call_batch_calls_each_get_their_own_decision(tmp_path):
     marker = tmp_path / "touched"
     calls = [
         ToolCall(id="c1", name="bash", arguments={"command": f"touch {marker}"}),
@@ -161,6 +161,18 @@ def test_yes_flag_parses(monkeypatch):
     assert _parse_args().yes
 
 
+def test_trace_flags_parse(monkeypatch):
+    from corecoder.cli import _parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["corecoder", "--trace", "run.jsonl", "--trace-content"],
+    )
+    args = _parse_args()
+    assert args.trace == "run.jsonl"
+    assert args.trace_content is True
+
+
 def test_ask_prompt_maps_answers(monkeypatch):
     from corecoder import cli
     answers = iter(["y", "a", "n", "garbage"])
@@ -170,6 +182,77 @@ def test_ask_prompt_maps_answers(monkeypatch):
     assert cli._ask_permission("bash", {}) == "always"
     assert cli._ask_permission("bash", {}) == "deny"
     assert cli._ask_permission("bash", {}) == "deny"  # junk input is a no
+
+
+def test_nested_permission_prompt_suspends_active_progress(monkeypatch):
+    from corecoder import cli
+
+    events = []
+
+    class FakeProgress:
+        def stop(self):
+            events.append("progress stopped")
+
+        def start(self):
+            events.append("progress resumed")
+
+    display = cli._ToolProgressDisplay()
+    display._progress = FakeProgress()
+    monkeypatch.setattr(cli._ACTIVE_TOOL_PROGRESS, "display", display, raising=False)
+
+    def prompt(*_args, **_kwargs):
+        events.append("prompt read")
+        return "y"
+
+    monkeypatch.setattr(cli, "pt_prompt", prompt)
+
+    assert cli._ask_permission("write_file", {"file_path": "child.txt"}) == "once"
+    assert events == ["progress stopped", "prompt read", "progress resumed"]
+
+
+def test_foreground_subagent_nested_permission_is_readable(monkeypatch, tmp_path):
+    import io
+
+    from rich.console import Console
+
+    from corecoder import cli
+
+    target = tmp_path / "child.txt"
+    prompt_states = []
+    answers = iter(["y", "y"])
+
+    def prompt(*_args, **_kwargs):
+        active = getattr(cli._ACTIVE_TOOL_PROGRESS, "display", None)
+        prompt_states.append(
+            None if active is None else active._progress.live.is_started
+        )
+        return next(answers)
+
+    monkeypatch.setattr(cli, "pt_prompt", prompt)
+    display = cli._ToolProgressDisplay(Console(
+        file=io.StringIO(),
+        force_terminal=False,
+        color_system=None,
+    ))
+    agent = Agent(
+        llm=ScriptedLLM([
+            LLMResponse(tool_calls=[ToolCall(
+                id="parent-call",
+                name="agent",
+                arguments={"task": "write the file"},
+            )]),
+            LLMResponse(tool_calls=[_write_call("child-call", target)]),
+            LLMResponse(content="child done"),
+            LLMResponse(content="parent done"),
+        ]),
+        tools=[AgentTool(), WriteFileTool()],
+        permission=Permission(ask=cli._ask_permission),
+        workspace=tmp_path,
+    )
+
+    assert agent.chat("go", on_tool_progress=display) == "parent done"
+    assert target.read_text(encoding="utf-8") == "x\n"
+    assert prompt_states == [None, False]
 
 
 def test_ask_prompt_eof_denies(monkeypatch):

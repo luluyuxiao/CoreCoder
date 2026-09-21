@@ -4,11 +4,11 @@
 
 模型本身只会做一件事，根据上文吐出下文。它不能读你的文件，不能跑你的测试，不能往磁盘写一个字节。让它从「会说」变成「会做」的，是工具。工具是 agent 真正接触世界的那只手。所以一个 agent 强不强，很大程度上取决于它的工具设计得好不好：接口是否清晰、错误反馈是否到位、危险操作是否拦得住。
 
-CoreCoder 给了模型七个工具：`bash`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`agent`。这一篇我们先看它们共同的骨架，再细抠其中两个最值得说的，最后我带你写一个自己的。
+CoreCoder 默认给模型十一个工具：`bash`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`todo_write`、`agent`、`agent_status`、`fetch_url`、`now`。这一篇我们先看它们共同的骨架，再细抠其中两个最值得说的，最后我带你写一个自己的。
 
 ## 一个工具长什么样
 
-所有工具继承自 `tools/base.py` 里的 `Tool`，整个基类 27 行：
+所有工具继承自 `tools/base.py` 里的 `Tool`，副作用类型也定义在同一个小文件里：
 
 ```python
 class Tool(ABC):
@@ -17,6 +17,7 @@ class Tool(ABC):
     name: str
     description: str
     parameters: dict  # JSON Schema for the function args
+    effect: str = ToolEffect.UNKNOWN
 
     @abstractmethod
     def execute(self, **kwargs) -> str:
@@ -33,31 +34,32 @@ class Tool(ABC):
                 "parameters": self.parameters,
             },
         }
+
+    def is_concurrency_safe(self) -> bool:
+        return self.effect in {ToolEffect.PURE, ToolEffect.READ}
 ```
 
-一个工具就是四样东西：一个名字，一段给模型看的描述，一份描述参数的 JSON Schema，一个真正干活的 `execute`。`schema()` 把前三样拼成 OpenAI function calling 要的格式，发给模型，模型据此决定要不要调、怎么填参数。
+一个工具的 LLM 接口仍是四样东西：名字、描述、参数 JSON Schema 和真正干活的 `execute`。额外的 `effect` 只给本地调度器看，不会进入发给模型的 schema；它决定获准的调用能否并发。`PURE/READ` 可以进入只读并发批次，`WRITE/EXTERNAL/UNKNOWN` 串行执行。
 
 这里有个设计选择值得点一句。CoreCoder 没有搞工具的继承体系，没有 `FileTool` 派生 `ReadTool` 派生什么的。每个工具就是 `Tool` 的一个直接子类，自己管自己。Claude Code 走得更彻底，公开拆解里它压根不用 class 继承，而是用一个 `buildTool()` 工厂函数，把名字、schema、执行逻辑、权限检查当作配置传进去，拼出一个工具对象。两者背后是同一个判断：工具之间没什么真正可共享的行为，硬套继承只会增加耦合。组合优于继承，在这种地方体现得特别干净。
 
-工具的注册也朴素到家，`tools/__init__.py` 里就是一个列表：
+工具的注册也朴素到家，`tools/__init__.py` 里的 `build_tools()` 返回一个实例列表：
 
 ```python
-ALL_TOOLS = [
-    BashTool(),
-    ReadFileTool(),
-    WriteFileTool(),
-    EditFileTool(),
-    GlobTool(),
-    GrepTool(),
-    AgentTool(),
-]
+def build_tools(...):
+    return [
+        BashTool(),
+        ReadFileTool(),
+        # ...其余工具...
+        AgentTool(),
+    ]
 ```
 
 想加工具，往这个列表里塞一个实例就行。这件事我们留到本篇最后真做一次。
 
 ## edit_file：一个看着平平无奇的关键创新
 
-七个工具里，如果只能挑一个讲，我会挑 `edit_file`。因为「让模型修改一个已有文件」这个看似简单的需求，背后死过好几条路。
+这些工具里，如果只能挑一个讲，我会挑 `edit_file`。因为「让模型修改一个已有文件」这个看似简单的需求，背后死过好几条路。
 
 第一条死路是让模型按行号打补丁，比如「把第 42 行换成这样」。问题是模型对行号的感知极不可靠，它脑子里的第 42 行和文件里真实的第 42 行经常对不上，差一行就改错地方。而且只要文件在前面被动过一次，后面所有行号全部漂移。
 
@@ -115,7 +117,7 @@ except UnicodeDecodeError:
 
 `read_file`、`edit_file` 这些工具能造成的破坏有限。`bash` 不一样，它能跑任意 shell 命令，模型一旦写出 `rm -rf /`，后果是真实的。
 
-Claude Code 的 `BashTool` 公开拆解里是 1143 行，里头有命令分类器、有基于 `sandbox-exec` 和 `seccomp` 的真沙箱、有输出截断、有交互式命令拦截。CoreCoder 的 `bash.py` 是 127 行的蒸馏版，保留了四件最要紧的事：危险命令检测、输出截断、超时、工作目录跟踪。
+Claude Code 的 `BashTool` 公开拆解里是 1143 行，里头有命令分类器、有基于 `sandbox-exec` 和 `seccomp` 的真沙箱、有输出截断、有交互式命令拦截。CoreCoder 最初的 `bash.py` 是 127 行的蒸馏版，只保留危险命令检测、输出截断、超时和工作目录跟踪；当前源码又在外面加了一层可选的 Docker 执行后端，下面先讲默认 `local` 模式中仍然保留的正则安全闸。
 
 危险命令检测是一张正则黑名单：
 
@@ -141,7 +143,7 @@ if warning:
 
 那两条 `rm` 正则我想多说一句，因为它们体现了写黑名单的人有没有认真想过对手。第一条盯的是「递归删除指向根目录或家目录」，注意 force 标志写成可选，因为 `rm -r /` 不带 `-f` 一样危险。第二条用了两个前瞻断言，分别要求命令里同时出现 `-r`（或 `-R`）和 `-f`，但不管它们的顺序和写法。这是因为 `rm -rf`、`rm -fr`、`rm -r -f`、`rm -f -r` 是同一件事的四种写法，一条朴素的 `rm -rf` 字面匹配会漏掉后三种。测试 `test_bash_blocks_rm_force_recursive_variants` 把这些变体连同长选项 `--recursive --force` 一起喂进去，逐个验证拦得住。同时它还得放过正常的 `rm -f notes.log`、`rm -r ./build_output`，不能一杆子打死所有 `rm`。
 
-这里要把一条边界划清楚：**这张黑名单不是安全边界，它只是一道防手滑的闸**。正则黑名单天生拦不住有心人，命令可以 base64 编码，可以从变量里拼，可以用一百种方式绕过去。它能挡住的是模型一时糊涂生成的那种最常见、最直白的灾难命令，挡不住蓄意攻击。Claude Code 之所以要上 `seccomp` 这种内核级沙箱，正是因为黑名单这条路在安全上走不通。CoreCoder 选择黑名单，是在「教学清晰度」和「真实安全」之间做的明确取舍：它让你一眼看懂「危险拦截」这个设计点长什么样，但它没假装自己是生产级的安全方案。如果你拿 CoreCoder 去接一个不可信的使用场景，沙箱是你必须自己补上的一课。这点[第七篇](07-build-your-own.md)还会回来谈。
+这里要把一条边界划清楚：**这张黑名单不是安全边界，它只是一道防手滑的闸**。正则黑名单天生拦不住有心人，命令可以 base64 编码，可以从变量里拼，可以用一百种方式绕过去。当前源码因此提供 `--sandbox docker`：每条 bash 命令进入一次性容器，默认断网、只读根文件系统、丢弃 capabilities，并且只把启动目录挂到 `/workspace`。正则仍然保留作纵深防御；默认 `local` 模式仍只有防手滑能力。这个容器边界也只覆盖 bash，hooks、MCP server 和 `fetch_url` 仍在宿主机运行，所以它是一个诚实的最小安全基线，不是假装完整的生产级沙箱。
 
 剩下两件事也顺带提一句。输出截断保留头尾，命令吐出几万行时只留前 6000 字符和后 3000 字符，中间用一行说明顶替，既不撑爆上下文又保住了最有用的开头和结尾。工作目录跟踪让 `cd` 在多次命令之间能记住，`_update_cwd` 还专门处理了 `cd a && cd b` 这种链式跳转，让 b 相对 a 解析而不是相对起点（测试 `test_bash_chained_cd_resolves_sequentially` 盯着它）。这些都是「跑命令」这件事在真实使用里会冒出来的小坑，一个一个填掉。
 
@@ -161,7 +163,7 @@ v0.6.0 在「调用前后」这条缝上又加了三样东西。它们不改变�
 
 第三个是 MCP。`mcp.py` 里每个 server 是一个子进程，走 stdio 上一行一条的 JSON-RPC：启动握手、`tools/list` 拉清单，然后每个远程工具以 `mcp__server__tool` 的名字登记进工具表，从此授权、hooks、plan 模式对它们和内置工具一视同仁。值得学的是这个「一视同」是怎么来的：不是靠 MCP 代码里写多少特殊分支，而是因为工具边界本身（`Tool` 基类加上面三道闸）定义得够干净，外部工具只是又一个实现类。一个挂着死掉的 server 最坏也就是那一次调用返回个错误字符串，循环照转。
 
-这三块都属于「进阶件」：它们不在 agent 的骨架上，骨架仍然是那个循环加七件工具。但它们回答的是同一个问题——一次工具调用前后，还有谁能说话。答案从「两道闸」变成了「两道闸加一圈可插拔的旁路」，而旁路的每一环都被设计成「坏了也不拖累主循环」。
+这三块都属于「进阶件」：它们不改变 agent 的循环骨架。但它们回答的是同一个问题——一次工具调用前后，还有谁能说话。答案从「两道闸」变成了「两道闸加一圈可插拔的旁路」，而旁路的每一环都被设计成「坏了也不拖累主循环」。
 
 ## 动手：写你自己的第一个工具
 
@@ -171,11 +173,12 @@ v0.6.0 在「调用前后」这条缝上又加了三样东西。它们不改变�
 """A tool that tells the agent the current time."""
 
 import time
-from .base import Tool
+from .base import Tool, ToolEffect
 
 
 class NowTool(Tool):
     name = "now"
+    effect = ToolEffect.PURE
     description = "Get the current local date and time. Use this when the user asks about the current time or you need a timestamp."
     parameters = {
         "type": "object",
@@ -187,16 +190,17 @@ class NowTool(Tool):
         return time.strftime("%Y-%m-%d %H:%M:%S")
 ```
 
-然后在 `tools/__init__.py` 里把它登记进去：
+然后在 `tools/__init__.py` 的 `build_tools()` 里把它登记进去：
 
 ```python
 from .now import NowTool
 
-ALL_TOOLS = [
-    BashTool(),
-    # ...原有的工具...
-    NowTool(),
-]
+def build_tools(...):
+    return [
+        BashTool(),
+        # ...原有的工具...
+        NowTool(),
+    ]
 ```
 
 就这样。没有别的步骤。重新跑 `corecoder`，问它「现在几点」，你会看到它调 `now`，再用结果回答你。
@@ -210,7 +214,7 @@ ALL_TOOLS = [
 - 工具是 agent 接触世界的手，工具设计的好坏直接决定 agent 的能力上限。
 - `edit_file` 的「唯一性搜索替换」是关键创新：用「原文必须在全文唯一」这个约束，把不可靠的「改文件」变成确定的操作，连报错都在教模型怎么改对。
 - 让模型生成 diff 不可靠，让工具生成 diff 给模型看完全可靠。生成与消费各归其位。
-- bash 的正则黑名单是防手滑的闸，不是安全边界。真要面对不可信场景，沙箱得自己补。把这点想清楚，比假装安全重要得多。
+- bash 的正则黑名单只是防手滑的闸；当前可选的 Docker 后端才是执行边界。它隔离 bash，但不隔离 hooks、MCP server 或 `fetch_url`，边界范围必须说清楚。
 - 加一个工具的成本极低：一个类加一行注册。这是 agent 可扩展性的来源。
 
 下一篇，我们看这只手背后接的是哪个大脑，以及怎么把任意一家的模型接进来、顺手算清楚花了多少钱。

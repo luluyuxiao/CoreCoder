@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import ClassVar
 
 from ..checkpoints import record as _record_checkpoint
-from .base import Tool
+from ..sandbox import WorkspacePathPolicy
+from .base import Tool, ToolEffect
 
 # track files changed this session for /diff
 _changed_files: set[str] = set()
@@ -19,6 +20,7 @@ _changed_files: set[str] = set()
 
 class EditFileTool(Tool):
     name = "edit_file"
+    effect = ToolEffect.WRITE
     description = (
         "Edit a file by replacing an exact string match. "
         "old_string must appear exactly once in the file for safety. "
@@ -43,9 +45,16 @@ class EditFileTool(Tool):
         "required": ["file_path", "old_string", "new_string"],
     }
 
+    def __init__(self, path_policy: WorkspacePathPolicy | None = None):
+        self.path_policy = path_policy
+
     def execute(self, file_path: str, old_string: str, new_string: str) -> str:
         try:
-            p = Path(file_path).expanduser().resolve()
+            p = (
+                self.path_policy.resolve(file_path)
+                if self.path_policy
+                else Path(file_path).expanduser().resolve()
+            )
             if not p.exists():
                 return f"Error: {file_path} not found"
 

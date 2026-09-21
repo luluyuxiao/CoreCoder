@@ -2,7 +2,7 @@
 
 The last two pieces covered the loop and the tools, the agent's hands and feet. This piece covers the brain's interface: how the model gets plugged in, how streaming output is handled, how to survive a provider acting up, and a question many tutorials skip but that you'll care about on day one after going live, namely how much this round actually cost.
 
-The file is `corecoder/llm.py`, 336 lines, the largest single file in the whole project. It's large because it carries, on your behalf, all the inelegant parts of dealing with a real API.
+The file is `corecoder/llm.py`, 498 lines, the largest single file in the whole project. It's large because it carries, on your behalf, all the inelegant parts of dealing with a real API.
 
 ## A bet: everyone looks like OpenAI
 
@@ -108,11 +108,27 @@ def _call_with_retry(self, params: dict, max_retries: int = 3):
                 raise
 ```
 
-The logic is classic exponential backoff: failures that are obviously transient, like rate limiting, timeout, and connection errors, get retried after 1, 2, 4 seconds, and after three tries it gives up and raises. Server-side 5xx is retried too, but client-side 4xx (bad arguments, auth failure, that sort) is never retried, because retrying a hundred times gives the same result and only wastes the wait.
+The logic is classic exponential backoff: an obviously transient failure such as rate limiting, timeout, or a connection error waits one second after the first failure and two after the second, for three total attempts including the initial request. Server-side 5xx is retried too, but client-side 4xx (bad arguments, auth failure, that sort) is never retried, because retrying a hundred times gives the same result and only wastes the wait.
 
 This retry logic is worth calling out specifically, because "a project this small surely has no room to bother with retries" is a natural misconception, and the truth is the opposite. Retry is not only present, it's thought through quite carefully, even defending with `getattr` against the base `APIError` possibly lacking a `status_code` attribute (different SDK versions have different exception hierarchies, and grabbing the attribute by force would blow up).
 
-What CoreCoder didn't do is Claude Code's heavier graceful degradation: auto-switching to a fallback model on persistent server-side 529s, and a dollar-denominated budget cap. It genuinely didn't do these two, but the reason isn't oversight, it's a tradeoff. A fallback model involves the "which model can stand in for which" policy that's hard to unify across providers, and a dollar budget requires maintaining a price table that keeps changing. CoreCoder did the part it could implement cleanly (backoff retry) and left the part that would drag in a lot of provider-specific logic (fallback, hard budget) for you to add as needed. Knowing "what it did" and "what it deliberately didn't do" is far more useful than a vague "it's crude."
+## Fallback starts only after retry is exhausted
+
+The current source now has an explicit fallback chain. It does not guess which model can replace which; configuration owns that policy through `CORECODER_FALLBACK_MODELS=gpt-5.4-mini,gpt-4o-mini` or repeated `--fallback-model` flags. Each `LLM.chat()` round starts with the active model. Only rate limits, timeouts, connection failures, or 5xx errors that exhaust `_call_with_retry` advance to the next model. Parameter and authentication 4xx errors never trigger fallback because another model cannot repair bad configuration.
+
+```python
+candidates = [self.model, *self.fallback_models]
+for candidate in candidates:
+    try:
+        stream = self._call_with_retry({**params, "model": candidate})
+        self.model = candidate
+        break
+    except Exception as e:
+        if not self._is_fallback_error(e):
+            raise
+```
+
+A successful switch is sticky: later rounds continue directly on the fallback instead of waiting for the primary to fail every time. `fallback_history` records switches, and `/tokens` shows the active model. A stream that dies before its first chunk can safely fall back; once any token has reached `on_token`, CoreCoder does not replay automatically, because that could duplicate visible text or tool arguments. Candidates on one `LLM` instance share a backend, `base_url`, and explicit credential, so the OpenAI-compatible path suits providers routing several models through one endpoint. LiteLLM can express `provider/model` names, while provider-specific credentials must still come from the environment or a future routing layer.
 
 There's also an easily overlooked coordination detail. `stream_options` is an OpenAI extension that some providers don't recognize and answer with a 400. CoreCoder handles it like this:
 
@@ -124,7 +140,7 @@ except BadRequestError:
     stream = self._call_with_retry(params)
 ```
 
-Catch `BadRequestError` (400), drop `stream_options`, and try once more. The comment specifically explains why the fallback is only here and not folded into `_call_with_retry`: because `_call_with_retry` has already retried the transient errors, and stuffing this "drop a param and retry" in there too would double the retry count. Two kinds of retry, one for "the param was rejected" and one for "a transient failure," have different causes, so they stay separate and uncoupled. This kind of accounting for "why this code is here and not there" is the most valuable thing when reading source.
+Without a USD budget, a `BadRequestError` (400) can still remove `stream_options` and retry once. With a budget configured, that degradation is unsafe: without `include_usage`, the client cannot know what was spent, so it fails closed with `BudgetExceededError`. The mechanisms remain separate: dialect adaptation handles parameter compatibility, exponential backoff handles transient failure, and model fallback receives only the latter after retries are exhausted.
 
 ## The OpenAI-incompatible ones go to LiteLLM
 
@@ -158,19 +174,18 @@ _PRICING = {
 }
 ```
 
-The `estimated_cost` property takes the accumulated tokens and multiplies by the matching unit price:
+`estimated_cost` accumulates `usage_by_model` against each response model's own price. A switch to a cheaper fallback therefore never reprices all earlier primary-model tokens at the current model's rate:
 
 ```python
 @property
 def estimated_cost(self) -> float | None:
-    pricing = _PRICING.get(self.model)
-    if not pricing:
-        return None
-    input_rate, output_rate = pricing
-    return (
-        self.total_prompt_tokens * input_rate / 1_000_000
-        + self.total_completion_tokens * output_rate / 1_000_000
-    )
+    total = 0.0
+    for model, tokens in self.usage_by_model.items():
+        pricing = _pricing_for_model(model)
+        if not pricing:
+            return None
+        total += cost(tokens, pricing)
+    return total
 ```
 
 Notice the return type is `float | None`. For a model not in the table, it doesn't guess, it honestly returns `None`, and the CLI, seeing `None`, just doesn't show a price rather than inventing a number to fool you. This is a small but important honesty: better to say "I don't know" than to hand you a cost that looks precise but is made up. The CLI's `/tokens` command shows it:
@@ -179,11 +194,13 @@ Notice the return type is `float | None`. For a model not in the table, it doesn
 Tokens: 12043 prompt + 3201 completion = 15244 total  (~$0.0621)
 ```
 
-Of course this is only an estimate; the price table goes stale, and cache discounts and batch pricing aren't counted. But for a sense of "roughly how much money did this run burn," at this order of magnitude it's enough. An agent that gives you a feel for cost, versus one that makes you flinch at the bill at month's end, are two different experiences.
+Set `CORECODER_MAX_COST_USD=1.00` or pass `--max-cost 1.00`, and the estimate becomes an execution gate. Before each request, `LLM` subtracts already reported cost, conservatively reserves input cost using the serialized request's UTF-8 byte count plus protocol headroom, converts the remaining dollars into an output-token ceiling, and lowers `max_tokens`. If the remaining money cannot cover the next input, it stops before sending the request.
+
+Budget mode is fail-closed: a model absent from `_PRICING`, a provider that rejects usage reporting, or a response with no token usage all stop further spending. “Hard” here means a client-side execution cap based on the current price table and provider-reported usage, not a cloud-billing guarantee: prices can go stale, cache discounts are omitted, and a failed or partial stream may be billed without returning usage. Production deployments should still add provider-account quota alerts.
 
 ## Where config comes from
 
-Finally, a thread through `config.py` (57 lines). It reads config from environment variables with a sensible priority:
+Finally, a thread through `config.py`. It reads config from environment variables with a sensible priority:
 
 ```python
 api_key = (
@@ -196,12 +213,19 @@ api_key = (
 
 The dedicated variable wins, then it falls back to the generic `OPENAI_API_KEY`, then to `DEEPSEEK_API_KEY`. It also walks up from the current directory to the home directory loading a `.env` file (`override=False`, so it won't overwrite the real environment variables you've already set). This way you drop a `.env` in the project directory and it works on entry, no need to export every time. A small thing, but handy.
 
+Fallback and budget settings can live in the same `.env`:
+
+```bash
+CORECODER_FALLBACK_MODELS=gpt-5.4-mini,gpt-4o-mini
+CORECODER_MAX_COST_USD=1.00
+```
+
 ## What this piece leaves you with
 
 - The bet that "most providers are OpenAI-compatible" lets the whole provider layer thin out to a single wrapper over the openai SDK, and switching providers is two environment variables.
 - In streaming output, tool-call arguments arrive in fragments, to be accumulated by index then `json.loads`-ed, and bad data must degrade gracefully.
 - Retry belongs in the provider layer, not stuffed into the main loop. Exponential backoff retries only transient failures and 5xx, never 4xx.
-- CoreCoder did backoff retry and deliberately skipped the fallback model and dollar hard budget, because the latter two drag in a lot of provider-specific logic. Tell "didn't do" apart from "deliberately didn't do."
-- Cost estimation returns `None` for an unknown model rather than inventing a falsely precise number. Honesty beats looking good.
+- Fallback catches only retry-exhausted transient and 5xx failures, never 4xx; a successful switch stays active so each round does not repeat the same wait.
+- Cost is accumulated per model; the USD budget reserves input and caps maximum output before a request, failing closed on unknown pricing or missing usage.
 
 Next piece, we face the agent's hardest physical constraint: the context window is only so big, and how a long task fits inside it.

@@ -85,21 +85,22 @@ class FetchUrlTool(Tool):
         return text
 ```
 
-Register it in `tools/__init__.py`:
+Register it in `build_tools()` in `tools/__init__.py`:
 
 ```python
 from .fetch import FetchUrlTool
 
-ALL_TOOLS = [
+def build_tools(...):
+    return [
     BashTool(),
     # ...the existing ones...
     FetchUrlTool(),
-]
+    ]
 ```
 
 Run it and ask "fetch https://raw.githubusercontent.com/he-yufeng/CoreCoder/main/README.md and tell me what this project does," and it'll call `fetch_url` and then explain it to you.
 
-This little tool actually puts several lessons from the earlier pieces to use. Truncation keeping head and tail is the trick that recurred in pieces two and four. Decoding with `errors="replace"` and turning any exception into one line of plain language via a big try-except is also the "don't pass bad data's buck to the user" you've seen all along. And there's the one from piece five that matters most to take to heart: can your tool withstand being called concurrently? This `fetch_url` can, because it has no shared mutable state at all; each call brings its own URL and produces its own result, and two threads running it at once don't interfere. That isn't luck, it's design. A tool you can make stateless, don't add state to; that's the most effortless way to make your tool concurrency-safe by default.
+This little tool actually puts several lessons from the earlier pieces to use. Truncation keeping head and tail is the trick that recurred in pieces two and four. Decoding with `errors="replace"` and turning any exception into one line of plain language via a big try-except is also the "don't pass bad data's buck to the user" you've seen all along. And there's the question from piece five: can your tool withstand concurrent calls? `fetch_url` itself has no shared mutable state, but the current source still marks it `EXTERNAL`, so the Agent scheduler conservatively serializes it. These are separate concerns: a tool may be internally thread-safe while scheduling policy declines to overlap it because of service rate limits or unknown external effects. It can be promoted to `READ` once that contract is established, but unknown external capabilities should not be parallel by default.
 
 But, just as piece two did with bash, I have to put one of this tool's soft spots on the table. This `fetch_url` has a real security weakness called SSRF: it can access any URL, which includes `http://localhost`, intranet addresses, and that notorious cloud metadata endpoint `http://169.254.169.254`. Using it yourself on your own machine, no big deal. But the moment you wire this agent into a scenario that executes a stranger's instructions, this tool becomes a hole through which someone probes your intranet. To plug it, you'd parse the URL into an IP inside `execute` and block private address ranges and loopback. I deliberately didn't write that part, to let you clearly see what this hole looks like rather than hiding it and pretending it doesn't exist. Every time you add a tool that can take an outward action, first ask "what's the worst this could be used for," and that habit is worth more than any specific piece of protective code.
 
@@ -165,13 +166,13 @@ I single out this step because it's the watershed between "dabbling" and "doing 
 
 ## Where you can go further
 
-CoreCoder is a starting point, not a destination. It deliberately leaves blanks in quite a few places, and every one is a direction you can build out, and the earlier pieces mostly named them by name:
+CoreCoder is a starting point, not a destination. This list was written against an earlier snapshot; the current source now includes an MCP tools client and an optional Docker bash sandbox, so those two entries are directions for hardening and extension rather than greenfield work:
 
-- **Put a real sandbox on bash.** Piece two said it plainly, the regex blocklist is only a guard against slips, not a security boundary. To face untrusted input, you need `seccomp` or container-level isolation.
-- **Add a fallback model and a hard dollar budget.** Piece three covered how CoreCoder deliberately skipped these two, because they drag in provider-specific logic. For a production deployment, these two eventually have to be added.
-- **Make concurrency finer-grained.** Piece five's point about distinguishing whether a tool "reads" or "writes" to decide whether it can run concurrently is something CoreCoder still doesn't do, and is worth filling in seriously.
-- **Hook up MCP.** Let your agent plug into the Model Context Protocol tool ecosystem, instantly connecting to a large batch of ready-made external capabilities.
-- **Give sub-agents more modes.** Piece five mentioned Claude Code's sub-agents can run in an independent worktree or in the background, while CoreCoder only did the most plain synchronous one.
+- **Harden the bash sandbox.** `--sandbox docker` now provides container isolation, no network by default, a read-only root filesystem, and resource limits. Next steps include custom seccomp/AppArmor, a read-only workspace mode, per-task images, and bringing hooks and MCP server processes inside the boundary.
+- **Keep extending model routing and budgets.** The current source has an explicit fallback chain and a fail-closed USD budget. Production deployments can add per-provider credentials, circuit breakers and health checks, task-aware routing, and account-side billing quotas.
+- **Keep refining concurrent scheduling.** `Tool.effect` now groups `PURE/READ` calls into parallel batches and treats `WRITE/EXTERNAL/UNKNOWN` calls as serial barriers. The next step is resource-level read/write sets, path locks, dependency DAGs, and speculative execution while a streamed response is still being generated.
+- **Extend MCP.** `mcp.py` now connects third-party MCP tools over stdio; resources, prompts, HTTP transport, authentication, and fuller server lifecycle management remain open extensions.
+- **Keep strengthening the sub-agent runtime.** Foreground/background and shared/worktree combinations are now implemented; durable workers, cancellation and timeouts, event streams, automatic merge/cherry-pick policy, and process- or host-level scheduling remain open.
 
 Pick one you genuinely need and do it. Don't let the length of the list make you anxious; the charm of an agent is exactly that its core is small enough for one person to read through in a weekend, and its frontier is open enough that you can grow in any direction.
 
@@ -179,7 +180,7 @@ Pick one you genuinely need and do it. Don't let the length of the list make you
 
 If this series leaves you with only one thing, I hope it's this: a coding agent is less mysterious than it seems, it's just a stack of engineering decisions you can fully reach, piled up.
 
-Looking back over the six pieces, it's really only a few blocks. A capped loop (piece one), plus a set of clean-interfaced tools that let it act (piece two). The model interface is a thin provider wrapper (piece three), and context fights forgetting with layered compression (piece four). It can split itself and run concurrently, on the strength of restraint about shared state (piece five); the outermost CLI emits events, handles presentation, and plugs the path-traversal hole while it's at it (piece six). The engine adds up to just over a thousand lines, and even with that CLI shell on top the whole package is only 1714, with not a single spot you can't understand.
+Looking back over the six pieces, it's really only a few blocks. A capped loop (piece one), plus a set of clean-interfaced tools that let it act (piece two). The model interface is a thin provider wrapper (piece three), and context fights forgetting with layered compression (piece four). It can split itself and run concurrently, on the strength of restraint about shared state (piece five); the outermost CLI emits events, handles presentation, and plugs the path-traversal hole while it's at it (piece six). The current package is 3,650 lines, still without a point that requires a black box to understand.
 
 Now you don't just understand it, you've forked it, plugged in your own model, added your own tool, and tuned its own temperament. It's yours.
 

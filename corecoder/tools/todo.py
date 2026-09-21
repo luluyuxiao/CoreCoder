@@ -14,13 +14,14 @@ shared list is what lets the whole pattern fit in a file this small.
 
 from typing import ClassVar
 
-from .base import Tool
+from .base import Tool, ToolEffect
 
 _VALID_STATUS = ("pending", "in_progress", "done")
 
 
 class TodoWriteTool(Tool):
     name = "todo_write"
+    effect = ToolEffect.WRITE
     description = (
         "Manage the session task checklist. Pass the complete list every time; it fully "
         "replaces the old one. Use it to plan multi-step work: write the list up front, "
