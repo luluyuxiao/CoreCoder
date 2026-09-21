@@ -1,0 +1,15 @@
+{
+  "cases": [
+    {
+      "name": "identify-package",
+      "workspace": "..",
+      "prompt": "Read pyproject.toml and report the exact Python package name. Keep the final answer to one sentence.",
+      "expect": {
+        "response_contains": ["corecoder"],
+        "tool_calls_include": ["read_file"],
+        "max_tool_calls": 4,
+        "max_llm_rounds": 5
+      }
+    }
+  ]
+}
