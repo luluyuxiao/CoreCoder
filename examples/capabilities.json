@@ -1,0 +1,15 @@
+{
+  "default": "deny",
+  "tools": {
+    "read_file": {"allow": ["filesystem_read"]},
+    "grep": {"allow": ["filesystem_read"]},
+    "glob": {"allow": ["filesystem_read"]},
+    "load_skill": {"allow": ["filesystem_read"]},
+    "write_file": {"allow": ["filesystem_write"]},
+    "edit_file": {"allow": ["filesystem_read", "filesystem_write"]},
+    "bash": {"allow": ["filesystem_read", "filesystem_write", "process"]},
+    "fetch_url": {"allow": ["network"]},
+    "agent": {"allow": ["subagent"]},
+    "mcp__weather__*": {"allow": ["mcp", "process", "network"]}
+  }
+}

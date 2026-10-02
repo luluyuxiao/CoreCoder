@@ -1,0 +1,20 @@
+{
+  "defaults": {
+    "sandbox": {
+      "mode": "docker",
+      "image": "corecoder-sandbox:latest",
+      "network": "none",
+      "workspace": "none",
+      "memory": "512m",
+      "cpus": 0.5,
+      "pids": 64
+    }
+  },
+  "mcpServers": {
+    "sandbox_demo": {
+      "command": "python",
+      "args": ["/workspace/examples/minimal_mcp_server.py"],
+      "sandbox": {"workspace": "ro"}
+    }
+  }
+}

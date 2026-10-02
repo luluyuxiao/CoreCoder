@@ -1,0 +1,8 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "*",
+      "command": "\"$CORECODER_PYTHON\" -m corecoder.protect_paths_hook"
+    }
+  ]
+}
