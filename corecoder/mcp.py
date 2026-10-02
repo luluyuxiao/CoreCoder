@@ -4,11 +4,16 @@ Servers are configured in ~/.corecoder/mcp.json:
 
     {"mcpServers": {"fs": {"command": "npx", "args": ["-y", "some-fs-server", "/tmp"]}}}
 
+Each server may opt into a persistent hardened Docker stdio container:
+
+    {"sandbox": {"mode": "docker", "network": "none", "workspace": "ro"}}
+
 Each server is a subprocess speaking JSON-RPC 2.0, one message per line over
 stdin/stdout. Startup handshakes (`initialize`), pulls `tools/list`, and every
 remote tool joins the agent as `mcp__<server>__<tool>`, so consent, hooks and
-the main loop treat them exactly like the built-ins. A server that hangs or
-dies fails that one call as an ordinary error string; it never kills the loop.
+the capability policy and main loop treat them exactly like the built-ins. A
+server that hangs or dies fails that one call as an ordinary error string; it
+never kills the loop.
 """
 
 import atexit
@@ -21,6 +26,14 @@ import time
 from pathlib import Path
 
 from . import __version__
+from .capabilities import (
+    FILESYSTEM_READ,
+    FILESYSTEM_WRITE,
+    MCP,
+    NETWORK,
+    PROCESS,
+)
+from .sandbox import DockerCommandExecutor
 from .tools.base import Tool, ToolEffect
 
 log = logging.getLogger(__name__)
@@ -43,18 +56,67 @@ class MCPClient:
     keeps two threads' requests from interleaving on stdin.
     """
 
-    def __init__(self, name: str, command: str, args: list = (), env: dict | None = None):
+    def __init__(
+        self,
+        name: str,
+        command: str,
+        args: list = (),
+        env: dict | None = None,
+        *,
+        sandbox: dict | str | None = None,
+        workspace: str | Path | None = None,
+    ):
         self.name = name
         self.call_timeout = CALL_TIMEOUT
-        self._proc = subprocess.Popen(
-            [command, *args],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            env={**os.environ, **(env or {})},  # servers inherit the user env, config overrides
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,  # line buffered: the transport is newline-delimited JSON
-        )
+        self._docker_executor: DockerCommandExecutor | None = None
+        self._container_name: str | None = None
+        sandbox_spec = _normalize_sandbox(sandbox)
+        self.sandbox_mode = sandbox_spec["mode"]
+        self.workspace_access = sandbox_spec.get("workspace", "host")
+        if self.sandbox_mode == "docker":
+            root = Path(workspace or Path.cwd()).expanduser().resolve()
+            self._docker_executor = DockerCommandExecutor(
+                root,
+                image=sandbox_spec.get("image", "corecoder-sandbox:latest"),
+                network=sandbox_spec.get("network", "none"),
+                memory=sandbox_spec.get("memory", "512m"),
+                cpus=float(sandbox_spec.get("cpus", 0.5)),
+                pids_limit=int(sandbox_spec.get("pids", 64)),
+                docker_binary=sandbox_spec.get("docker_binary", "docker"),
+            )
+            self._proc, self._container_name = self._docker_executor.start_stdio_process(
+                command,
+                args,
+                env=_string_env(env),
+                workspace_access=self.workspace_access,
+            )
+            capabilities = {MCP, PROCESS}
+            if self._docker_executor.network != "none":
+                capabilities.add(NETWORK)
+            if self.workspace_access in {"ro", "rw"}:
+                capabilities.add(FILESYSTEM_READ)
+            if self.workspace_access == "rw":
+                capabilities.add(FILESYSTEM_WRITE)
+            self.capabilities = frozenset(capabilities)
+        else:
+            self.workspace_access = "host"
+            self._proc = subprocess.Popen(
+                [command, *_string_args(args)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                env={**os.environ, **_string_env(env)},
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,  # line buffered: the transport is newline-delimited JSON
+            )
+            # A host process inherits the user's filesystem and network access.
+            self.capabilities = frozenset({
+                MCP,
+                PROCESS,
+                NETWORK,
+                FILESYSTEM_READ,
+                FILESYSTEM_WRITE,
+            })
         self._next_id = 0
         self._dead: MCPError | None = None
         self._responses: dict[int, dict] = {}
@@ -91,16 +153,24 @@ class MCPClient:
     def close(self):
         """Shut the server down. Safe to call twice."""
         if self._proc.poll() is not None:
+            self._remove_container()
             return
         try:
             self._proc.stdin.close()
-        except OSError:
+        except (OSError, ValueError):
             pass
         self._proc.terminate()
         try:
             self._proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self._proc.kill()
+        finally:
+            self._remove_container()
+
+    def _remove_container(self):
+        if self._docker_executor is not None and self._container_name is not None:
+            self._docker_executor.remove_container(self._container_name)
+            self._container_name = None
 
     def _notify(self, method: str):
         try:
@@ -173,6 +243,7 @@ class MCPTool(Tool):
         self.name = f"mcp__{client.name}__{spec['name']}"
         self.description = spec.get("description") or ""
         self.parameters = spec.get("inputSchema") or {"type": "object", "properties": {}}
+        self.capabilities = client.capabilities
 
     def execute(self, **kwargs) -> str:
         return self._client.call_tool(self._remote_name, kwargs)
@@ -181,7 +252,11 @@ class MCPTool(Tool):
 _live_clients: list[MCPClient] = []
 
 
-def load_mcp_tools(path: Path = CONFIG_FILE) -> list[Tool]:
+def load_mcp_tools(
+    path: Path = CONFIG_FILE,
+    *,
+    workspace: str | Path | None = None,
+) -> list[Tool]:
     """Start the configured servers and return their tools. A missing file
     means no MCP; a broken file or a server that won't start gets one clear
     warning and the agent carries on with whatever loaded."""
@@ -192,16 +267,81 @@ def load_mcp_tools(path: Path = CONFIG_FILE) -> list[Tool]:
     except (json.JSONDecodeError, OSError) as e:
         log.warning("ignoring %s: %s", path, e)
         return []
+    defaults = data.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        log.warning("ignoring %s: 'defaults' must be an object", path)
+        return []
+    default_sandbox = defaults.get("sandbox")
+    servers = data.get("mcpServers") or {}
+    if not isinstance(servers, dict):
+        log.warning("ignoring %s: 'mcpServers' must be an object", path)
+        return []
     tools: list[Tool] = []
-    for name, spec in (data.get("mcpServers") or {}).items():
+    for name, spec in servers.items():
         try:
-            client = MCPClient(name, spec["command"], spec.get("args", []), spec.get("env"))
-        except (MCPError, OSError, KeyError, TypeError) as e:
+            if not isinstance(name, str) or not name:
+                raise ValueError("MCP server names must be non-empty strings")
+            if not isinstance(spec, dict):
+                raise TypeError("MCP server configuration must be an object")
+            server_sandbox = _merge_sandbox(default_sandbox, spec.get("sandbox"))
+            client = MCPClient(
+                name,
+                spec["command"],
+                _string_args(spec.get("args", [])),
+                spec.get("env"),
+                sandbox=server_sandbox,
+                workspace=workspace,
+            )
+        except (MCPError, OSError, KeyError, TypeError, ValueError) as e:
             log.warning("MCP server %r skipped: %s", name, e)
             continue
         _live_clients.append(client)
         tools.extend(client.tools)
     return tools
+
+
+def _string_env(env: dict | None) -> dict[str, str]:
+    if env is None:
+        return {}
+    if not isinstance(env, dict):
+        raise TypeError("MCP server env must be an object")
+    return {str(key): str(value) for key, value in env.items()}
+
+
+def _string_args(args) -> list[str]:
+    if not isinstance(args, (list, tuple)) or not all(
+        isinstance(item, (str, int, float)) for item in args
+    ):
+        raise TypeError("MCP server args must be a list of strings")
+    return [str(item) for item in args]
+
+
+def _normalize_sandbox(sandbox: dict | str | None) -> dict:
+    if sandbox is None:
+        return {"mode": "host"}
+    if isinstance(sandbox, str):
+        sandbox = {"mode": sandbox}
+    if not isinstance(sandbox, dict):
+        raise TypeError("MCP sandbox must be 'host', 'docker', or an object")
+    normalized = dict(sandbox)
+    mode = normalized.get("mode", "docker")
+    if mode not in {"host", "docker"}:
+        raise ValueError("MCP sandbox mode must be 'host' or 'docker'")
+    normalized["mode"] = mode
+    if mode == "docker":
+        workspace_access = normalized.get("workspace", "none")
+        if workspace_access not in {"none", "ro", "rw"}:
+            raise ValueError("MCP sandbox workspace must be 'none', 'ro', or 'rw'")
+        normalized["workspace"] = workspace_access
+    return normalized
+
+
+def _merge_sandbox(default, override):
+    if override is None:
+        return default
+    if isinstance(default, dict) and isinstance(override, dict):
+        return {**default, **override}
+    return override
 
 
 @atexit.register

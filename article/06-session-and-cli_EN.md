@@ -1,6 +1,6 @@
 # Turning it into a real command-line tool
 
-The first five pieces dissected the agent's internals: the loop, the tools, the model interface, context compression, parallelism and sub-agents. As lovely as these parts are, you can't use them directly, because one more layer is missing, a skin, a command-line interface where someone can sit down and talk to it, save, resume, and check status. This piece covers that skin, corresponding to `cli.py` (439 lines) and `session.py` (97 lines).
+The first five pieces dissected the agent's internals: the loop, the tools, the model interface, context compression, parallelism and sub-agents. As lovely as these parts are, you can't use them directly, because one more layer is missing, a skin, a command-line interface where someone can sit down and talk to it, save, resume, and check status. This piece covers that skin across `cli.py`, `session.py`, and `storage.py`.
 
 It's not just "a nice-to-have UI." Hidden in this skin is a security detail well worth discussing, which we save for the finale.
 
@@ -48,8 +48,11 @@ The REPL recognizes a set of slash commands that aren't sent to the model but di
 /tokens    show token usage and estimated cost
 /compact   manually trigger context compression
 /diff      list files changed this session
-/save      save the session to disk
+/save      save the active session immediately
+/session   show the active session and storage
 /sessions  list saved sessions
+/transcript [id]  inspect original events unaffected by context compaction
+/delete-session <id>  delete an inactive session
 ```
 
 These commands expose the core capabilities from the previous pieces as switches the user can flip directly. `/tokens` calls piece three's `estimated_cost`, `/compact` calls piece four's `maybe_compress`, `/diff` reads the "changed files" set that piece two's `edit_file` has been maintaining all along. The core prepared these capabilities long ago, and the CLI just gives each one a handy entry point.
@@ -83,11 +86,11 @@ def _run_once(agent, prompt):
 
 Note the exit codes. Interrupted by Ctrl+C exits 130 (the conventional exit code for "interrupted by a signal" on Unix), an error exits 1, normal exits 0. A command-line tool that wants to be scriptable must take exit codes seriously, because the caller relies on this number to judge whether you succeeded. This is again the kind of detail "a demo won't bother with, a product must."
 
-## The finale: don't let a session name tear up your filesystem
+## The finale: persistence must never store half an Agent protocol
 
-Now for the thing in `session.py` I most want you to remember.
+Now for the two things in `session.py` and `storage.py` worth remembering: never trust a Session ID, and persist only a message structure that can be resumed legally.
 
-Saving a session looks like the most harmless feature there is: dump `messages` and the model name to JSON and write it to disk, then load it back when reading. The filename uses the session id. The problem is exactly that id, which can come from the user. After `/save`, you resume with `corecoder -r <id>`, and that `<id>` is an arbitrary string the user types on the command line.
+Early versions dumped `messages` and the model name to JSON. The current version defaults to SQLite while retaining an atomic JSON backend and legacy migration. Whether it becomes a database key or a legacy filename, a Session ID can come from the user: the `<id>` in `corecoder -r <id>` is arbitrary command-line input.
 
 Imagine the most naive implementation: `SESSIONS_DIR / f"{session_id}.json"`. What if the user (or some upstream program feeding it a session name) sets the id to `../../etc/passwd`? That path resolves outside the session directory, your "save session" becomes "write a file to an arbitrary location," and "read session" becomes "read an arbitrary file." This is the classic path-traversal vulnerability that countless real systems have fallen to.
 
@@ -96,25 +99,24 @@ CoreCoder guards against it with two gates, defense in depth. The first regulari
 ```python
 _SAFE_SESSION_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
-def _normalize_session_id(session_id):
+def normalize_session_id(session_id):
     if not session_id:
-        return _new_session_id()
+        return new_session_id()
     name = session_id.strip().replace("\\", "/").split("/")[-1]
     name = _SAFE_SESSION_RE.sub("-", name).strip(".-_")
     if len(name) > _MAX_SESSION_ID_LEN:
         name = name[:_MAX_SESSION_ID_LEN].strip(".-_")
-    return name or _new_session_id()
+    return name or new_session_id()
 ```
 
 It first unifies backslashes into forward slashes (blocking Windows's `..\..\` form), then uses `split("/")[-1]` to take only the last segment, throwing away all the directory parts. So `../../etc/passwd` takes `passwd`, and `/etc/shadow` takes `shadow`. Then it replaces every character that isn't alphanumeric or `._-` with `-`, and trims off anything too long. A malicious path goes in, and out comes an ordinary filename that stays obediently inside the session directory.
 
-The second gate is a backstop in case the first somehow has a gap. After `_session_path` resolves the final path, it explicitly checks that its parent directory is the session directory itself:
+The compatible JSON backend has a second gate. After `JsonSessionStore._path` resolves the path, it explicitly checks that its parent is the session directory itself:
 
 ```python
-def _session_path(session_id):
-    path = (SESSIONS_DIR / f"{_normalize_session_id(session_id)}.json").resolve()
-    root = SESSIONS_DIR.resolve()
-    if root != path.parent:
+def _path(self, session_id):
+    path = (self.directory / f"{normalize_session_id(session_id)}.json").resolve()
+    if path.parent != self.directory:
         raise ValueError("Invalid session id")
     return path
 ```
@@ -123,22 +125,29 @@ def _session_path(session_id):
 
 Why two gates, isn't the first already enough? Because with security, single-point defense is fragile. The first gate is based on "sanitizing input," and if one day someone changes that regex and misses an attack form, the second gate, based on "validating the output's landing spot," still catches it, and vice versa. The two gates use completely different approaches (one handles input, one handles output), so they won't fail together. This is the essence of defense in depth: not counting on any single line of defense being absolutely reliable, but stacking several lines of defense with different principles so the attacker has to fool them all at once. This defense is watched by a string of tests, path traversal, absolute paths, Windows backslashes, overlong names, verifying one by one that the attack strings going in all become well-behaved filenames.
 
-By the way, `load_session` is also restrained about bad files:
+`JsonSessionStore.load` is also restrained about bad files:
 
 ```python
 try:
     data = json.loads(path.read_text(encoding="utf-8"))
-    return data["messages"], data["model"]
-except (json.JSONDecodeError, KeyError, OSError):
-    # a corrupt or truncated session file shouldn't crash resume
+    return SessionRecord(...)
+except (json.JSONDecodeError, KeyError, OSError, TypeError, ValueError):
     return None
 ```
 
-A session file written halfway and cut off by a power loss shouldn't crash in your face the next time you `-r` to resume; it should quietly return `None` and let the upper layer prompt "no such session found." It's handled of a piece with everything before: bad data degrades quietly, don't throw a traceback in the user's face.
+JSON writes no longer overwrite the destination directly: they write a same-directory temporary file, `flush + fsync`, then atomically `os.replace` it. A legacy file truncated by a power loss should return `None`, not crash the next `-r`. SQLite is the default backend, using WAL, `busy_timeout`, foreign keys, and `PRAGMA user_version` to support concurrency, transactions, and future schema migrations.
+
+More important is separating audit history from model context. `events` is an append-only Transcript: original user/assistant/tool-call/tool-result payloads never change because context was compacted. `messages` is Active Context, which Context Management may snip, summarize, or hard-collapse; Resume and the next LLM request load only this layer. Each stable save atomically upserts the Session, replaces Active Context, appends the not-yet-persisted Transcript tail, and records new summaries. Context can shrink without destroying history, while event IDs make repeated autosaves idempotent.
+
+The transaction boundary still respects the provider protocol. An assistant message with `tool_calls` but without every matching Tool Result is rejected by OpenAI-compatible providers. The Agent therefore does not treat every `append` as recoverable. It emits its storage-neutral `state_callback` only after a user message, after a complete tool-result batch, and on completion, failure, or interruption. A failure rolls the Active Context and Transcript tail back together to the previous stable state.
+
+The Active Context snapshot stores workspace, status, messages, model, token/cost, fallback usage, plan mode, todo state, and IDs for Tool Results the next LLM request has not consumed. Resume restores that compact state rather than feeding the complete Transcript back to the model, so `/tokens` does not reset, Todo survives, and fresh observations remain protected. `summaries` separately records compaction actions, the covered event sequence, before/after tokens, model, and summary messages. API keys and `always allow` grants are deliberately excluded: one is a secret, and the other would turn session-scoped consent into permanent authorization.
+
+The CLI autosaves to `~/.corecoder/sessions/sessions.db` by default. `--no-autosave` disables automatic writes without disabling `/save`; `--storage PATH` and `CORECODER_STORAGE_PATH` relocate the database. `/transcript [id]` inspects the original event history. v1/legacy JSON data is migrated on first read; originals already discarded by earlier compaction cannot be reconstructed, so `transcript_complete` remains false. Library users program against the `SessionStore` Protocol, while Agent itself knows only a snapshot callback and never imports `sqlite3`.
 
 ## Compared with Claude Code
 
-Claude Code's session and query engine (over a thousand lines in public teardowns) is far more complex; the state it manages, the terminal environments it accommodates, the concurrent sessions it handles are all far more numerous. But CoreCoder's version gathers what "a usable CLI agent" needs: streaming display, tool-event prompts, a set of state-managing commands, one-shot mode, session save and load, plus one proper line of security defense. The benefit of reading it is that you see in full where the seam between "core" and "shell" is, and how much a careful person thinks about behind a seemingly harmless feature (saving a session).
+Claude Code's session and query engine (over a thousand lines in public teardowns) is far more complex, with remote sync, conversation branches, and many more terminal states. CoreCoder nevertheless makes the crucial local persistence invariants visible: a pluggable backend, transactional snapshots, valid message boundaries, legacy migration, concurrent writes, and deliberate treatment of sensitive state.
 
 ## What this piece leaves you with
 
@@ -146,6 +155,9 @@ Claude Code's session and query engine (over a thousand lines in public teardown
 - Slash commands expose core capabilities as switches the user can flip directly; intercept mistyped slash commands and don't send them to the model as a task.
 - To be scriptable, take exit codes seriously: interrupt 130, error 1, normal 0.
 - A session id can come from the user, and path traversal is a real threat. Meet it with defense in depth: one gate sanitizes input, one validates the landing spot, and the two differ in approach so they won't fail together.
-- Bad data should degrade quietly: a corrupt save returns `None`, don't slam the user with a traceback.
+- Transcript serves auditability while Active Context serves the model budget; they cannot share one destructively compacted message list.
+- Agent transaction boundaries must respect protocol boundaries: one `tool_calls + tool results` group is committed whole, never as a half-resumable state.
+- Atomic JSON replacement prevents torn files; SQLite WAL, transactions, and schema versions address querying, concurrency, and evolution.
+- Persistence needs security judgment: state and usage can resume, while secrets and cross-process authorization should not be stored by default.
 
 The next piece is the finale, and the most hands-on: reassembling the parts dissected across these six pieces, walking you through forking CoreCoder into a coding agent that's genuinely your own.

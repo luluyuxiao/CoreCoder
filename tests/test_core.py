@@ -16,7 +16,9 @@ from corecoder import (
     BudgetExceededError,
     Config,
     JsonlTrace,
+    MemoryState,
     MemoryTrace,
+    SQLiteSessionStore,
     TraceSink,
     __version__,
 )
@@ -81,8 +83,10 @@ def test_public_api_exports():
     assert PublicContextOverflowError is ContextOverflowError
     assert TraceSink is not None
     assert JsonlTrace is not None
+    assert MemoryState is not None
     assert MemoryTrace is not None
-    assert len(ALL_TOOLS) == 11
+    assert SQLiteSessionStore is not None
+    assert len(ALL_TOOLS) == 12
 
 
 def test_config_from_env(monkeypatch):
@@ -101,6 +105,8 @@ def test_config_defaults(monkeypatch):
     monkeypatch.delenv("CORECODER_MAX_COST_USD", raising=False)
     monkeypatch.delenv("CORECODER_TRACE", raising=False)
     monkeypatch.delenv("CORECODER_TRACE_CONTENT", raising=False)
+    monkeypatch.delenv("CORECODER_STORAGE_PATH", raising=False)
+    monkeypatch.delenv("CORECODER_AUTOSAVE", raising=False)
 
     c = Config.from_env()
     assert c.model == "gpt-5.5"
@@ -110,6 +116,8 @@ def test_config_defaults(monkeypatch):
     assert c.max_cost_usd is None
     assert c.trace_path is None
     assert c.trace_content is False
+    assert c.storage_path is None
+    assert c.autosave is True
 
 
 def test_config_reads_trace_settings(monkeypatch, tmp_path):
@@ -120,6 +128,16 @@ def test_config_reads_trace_settings(monkeypatch, tmp_path):
     config = Config.from_env()
     assert config.trace_path == str(path)
     assert config.trace_content is True
+
+
+def test_config_reads_storage_settings(monkeypatch, tmp_path):
+    path = tmp_path / "sessions.db"
+    monkeypatch.setenv("CORECODER_STORAGE_PATH", str(path))
+    monkeypatch.setenv("CORECODER_AUTOSAVE", "false")
+
+    config = Config.from_env()
+    assert config.storage_path == str(path)
+    assert config.autosave is False
 
 
 # --- Context ---
@@ -352,15 +370,17 @@ def test_session_name_is_sanitized(tmp_path, monkeypatch):
     sid = save_session(msgs, "test-model", "../Research Notes!")
 
     assert sid == "Research-Notes"
-    assert (tmp_path / "Research-Notes.json").exists()
+    assert (tmp_path / "sessions.db").exists()
     assert load_session("../Research Notes!") is not None
 
 
-def test_session_not_found():
+def test_session_not_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(session_module, "SESSIONS_DIR", tmp_path)
     assert load_session("nonexistent_session_id") is None
 
 
-def test_list_sessions():
+def test_list_sessions(tmp_path, monkeypatch):
+    monkeypatch.setattr(session_module, "SESSIONS_DIR", tmp_path)
     sessions = list_sessions()
     assert isinstance(sessions, list)
 

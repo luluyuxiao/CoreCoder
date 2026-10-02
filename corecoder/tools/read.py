@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import ClassVar
 
+from ..capabilities import FILESYSTEM_READ
 from ..sandbox import WorkspacePathPolicy
 from .base import Tool, ToolEffect
 
@@ -10,6 +11,7 @@ from .base import Tool, ToolEffect
 class ReadFileTool(Tool):
     name = "read_file"
     effect = ToolEffect.READ
+    capabilities = frozenset({FILESYSTEM_READ})
     description = (
         "Read a file's contents with line numbers. "
         "Always read a file before editing it."

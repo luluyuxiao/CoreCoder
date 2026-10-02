@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
+from ..capabilities import SUBAGENT
 from ..sandbox import WorkspacePathPolicy, command_executor_for_workspace
 from .base import Tool, ToolEffect
 
@@ -50,6 +51,7 @@ class _Job:
 class AgentTool(Tool):
     name = "agent"
     effect = ToolEffect.EXTERNAL
+    capabilities = frozenset({SUBAGENT})
     description = (
         "Run a sub-agent with its own conversation and a 20-round limit. "
         "run_mode=foreground waits for the result; background returns a task ID "
@@ -229,6 +231,7 @@ class AgentTool(Tool):
     ) -> str:
         # Local import avoids the Agent -> AgentTool -> Agent cycle.
         from ..agent import Agent
+        from ..memory import MemoryState
 
         parent = self._parent_agent
         worktree = _create_worktree(parent.workspace, task_id) if isolation == "worktree" else None
@@ -245,6 +248,11 @@ class AgentTool(Tool):
                     )
                 permission = factory()
 
+            child_memory = MemoryState.from_dict({
+                "goal": task,
+                "constraints": parent.memory.constraints,
+                "decisions": parent.memory.decisions,
+            })
             sub = Agent(
                 llm=parent.llm,
                 tools=tools,
@@ -257,6 +265,8 @@ class AgentTool(Tool):
                 trace=parent.trace,
                 parent_agent_id=parent.agent_id,
                 subagent_task_id=task_id,
+                capability_policy=parent.capability_policy,
+                memory_state=child_memory,
             )
             result = sub.chat(task)
         except Exception as e:
@@ -299,6 +309,7 @@ class AgentStatusTool(Tool):
 
     name = "agent_status"
     effect = ToolEffect.READ
+    capabilities = frozenset()
     description = (
         "List background sub-agents or read one result. Supply wait_seconds to "
         "wait briefly. Jobs are in-process and do not survive CoreCoder exiting."
@@ -385,6 +396,7 @@ def _subagent_tools(tools: list[Tool], workspace: Path, isolated: bool) -> list[
     from .fetch import FetchUrlTool
     from .glob_tool import GlobTool
     from .grep import GrepTool
+    from .memory import MemoryUpdateTool
     from .now import NowTool
     from .read import ReadFileTool
     from .todo import TodoWriteTool
@@ -414,6 +426,8 @@ def _subagent_tools(tools: list[Tool], workspace: Path, isolated: bool) -> list[
             cloned.append(GrepTool(_path_policy(tool, workspace, isolated)))
         elif isinstance(tool, TodoWriteTool):
             cloned.append(TodoWriteTool())
+        elif isinstance(tool, MemoryUpdateTool):
+            cloned.append(MemoryUpdateTool())
         elif isinstance(tool, FetchUrlTool):
             cloned.append(FetchUrlTool())
         elif isinstance(tool, NowTool):

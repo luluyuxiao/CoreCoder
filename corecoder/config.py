@@ -49,6 +49,9 @@ class Config:
     sandbox_pids: int = 128
     trace_path: str | None = None
     trace_content: bool = False
+    storage_path: str | None = None
+    autosave: bool = True
+    capability_policy_path: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -85,4 +88,7 @@ class Config:
             sandbox_pids=int(os.getenv("CORECODER_SANDBOX_PIDS", "128")),
             trace_path=os.getenv("CORECODER_TRACE"),
             trace_content=_env_bool("CORECODER_TRACE_CONTENT"),
+            storage_path=os.getenv("CORECODER_STORAGE_PATH"),
+            autosave=_env_bool("CORECODER_AUTOSAVE", True),
+            capability_policy_path=os.getenv("CORECODER_CAPABILITY_POLICY"),
         )

@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import __version__
 from .agent import Agent
+from .capabilities import load_capability_policy
 from .config import Config
 from .llm import LLM, LiteLLM
 from .permissions import Permission
@@ -444,6 +445,7 @@ def _parse_args():
     parser.add_argument("--base-url")
     parser.add_argument("--api-key")
     parser.add_argument("--sandbox", choices=("local", "docker"))
+    parser.add_argument("--capability-policy", metavar="PATH")
     return parser.parse_args()
 
 
@@ -464,6 +466,9 @@ def main() -> int:
             config.api_key = args.api_key
         if args.sandbox:
             config.sandbox = args.sandbox
+        if args.capability_policy:
+            config.capability_policy_path = args.capability_policy
+        capability_policy = load_capability_policy(config.capability_policy_path)
         if not config.api_key:
             raise ValueError("no API key configured")
 
@@ -497,6 +502,7 @@ def main() -> int:
                 permission=Permission(allow_all=args.yes),
                 workspace=workspace,
                 trace=trace,
+                capability_policy=capability_policy,
             )
 
         report = run_eval_suite(
@@ -519,6 +525,7 @@ def main() -> int:
             "provider": config.provider,
             "base_url": config.base_url,
             "sandbox": config.sandbox,
+            "capability_policy": capability_policy.as_dict(),
             "repetitions": args.repeat,
             "allow_mutations": args.yes,
             "in_place": args.in_place,

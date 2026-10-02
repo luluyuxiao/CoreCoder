@@ -1,5 +1,7 @@
 """Tool registry."""
 
+from typing import TYPE_CHECKING
+
 from ..sandbox import CommandExecutor, WorkspacePathPolicy
 from .agent import AgentStatusTool, AgentTool
 from .bash import BashTool
@@ -7,18 +9,24 @@ from .edit import EditFileTool
 from .fetch import FetchUrlTool
 from .glob_tool import GlobTool
 from .grep import GrepTool
+from .memory import MemoryUpdateTool
 from .now import NowTool
 from .read import ReadFileTool
+from .skill import LoadSkillTool
 from .todo import TodoWriteTool
 from .write import WriteFileTool
+
+if TYPE_CHECKING:
+    from ..skills import SkillRegistry
 
 
 def build_tools(
     executor: CommandExecutor | None = None,
     path_policy: WorkspacePathPolicy | None = None,
+    skill_registry: "SkillRegistry | None" = None,
 ):
     """Create a fresh tool set, optionally bound to a sandbox policy."""
-    return [
+    tools = [
         BashTool(executor=executor),
         ReadFileTool(path_policy=path_policy),
         WriteFileTool(path_policy=path_policy),
@@ -28,9 +36,13 @@ def build_tools(
         TodoWriteTool(),
         AgentTool(),
         AgentStatusTool(),
+        MemoryUpdateTool(),
         FetchUrlTool(),
         NowTool(),
     ]
+    if skill_registry:
+        tools.append(LoadSkillTool(skill_registry))
+    return tools
 
 
 # Backwards-compatible default registry. The CLI uses build_tools() so each

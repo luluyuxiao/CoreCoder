@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import ClassVar
 
+from ..capabilities import FILESYSTEM_READ
 from ..sandbox import WorkspacePathPolicy
 from .base import Tool, ToolEffect
 
@@ -10,6 +11,7 @@ from .base import Tool, ToolEffect
 class GlobTool(Tool):
     name = "glob"
     effect = ToolEffect.READ
+    capabilities = frozenset({FILESYSTEM_READ})
     description = (
         "Find files matching a glob pattern. "
         "Supports ** for recursive matching (e.g. '**/*.py')."

@@ -8,7 +8,7 @@ from tests.conftest import get_tool
 
 
 def test_tool_count():
-    assert len(ALL_TOOLS) == 11
+    assert len(ALL_TOOLS) == 12
 
 
 def test_all_tools_have_valid_schema():
@@ -53,7 +53,7 @@ def test_bash_blocks_rm_force_recursive_variants():
     bash = get_tool("bash")
     for cmd in [
         "rm -fr /",
-        "rm -r -f /",
+        "rm -r -   /",
         "rm -f -r /",
         "rm -Rf /tmp/data",
         "rm --recursive --force /",

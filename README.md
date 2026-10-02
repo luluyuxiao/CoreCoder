@@ -2,7 +2,7 @@
 
 # CoreCoder
 
-**The nanoGPT of coding agents. A 2.6k-line engine inside 5,357 readable lines of pure Python: understand how a coding agent actually works, then fork your own.**
+**The nanoGPT of coding agents. A 3.2k-line engine inside 8,119 readable lines of pure Python: understand how a coding agent actually works, then fork your own.**
 
 *learn from it · fork it · ship something better*
 
@@ -12,7 +12,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Tests](https://github.com/he-yufeng/CoreCoder/actions/workflows/ci.yml/badge.svg)](https://github.com/he-yufeng/CoreCoder/actions)
-[![engine](https://img.shields.io/badge/engine-2597_LoC-blue)](article/00-index_EN.md)
+[![engine](https://img.shields.io/badge/engine-3202_LoC-blue)](article/00-index_EN.md)
 [![essays](https://img.shields.io/badge/source--reading-8_bilingual-orange)](article/00-index_EN.md)
 
 </div>
@@ -25,7 +25,7 @@
 
 | | CoreCoder | Claude Code | aider | nanoGPT |
 |---|---|---|---|---|
-| Lines of code | ~2,597 engine / 5,357 total | hundreds of thousands (closed) | tens of thousands of Python | ~600 (two files) |
+| Lines of code | ~3,202 engine / 8,119 total | hundreds of thousands (closed) | tens of thousands of Python | ~600 (two files) |
 | Time to read it all | one afternoon | can't (closed) | a few days of slogging | one afternoon |
 | Breakpoint, change, rerun? | yes, every line | no | yes, but there's a lot | yes |
 | What it's for | understand one, then fork your own | production coding assistant | terminal pair-programming | minimal GPT for teaching |
@@ -36,9 +36,9 @@ The nanoGPT column is there as a reference point: minimal, readable, but it teac
 
 I've always felt coding agents get talked about as if they were arcane. Strip a tool like Claude Code or Cursor all the way down and the core is a `while` loop wrapped around a large model, plus seven or eight tools that let it actually do things. The hard part was never the loop; it's everything the loop has to cope with once it meets the real world. CoreCoder is the minimal version that writes that core out honestly.
 
-The engine (loop, model interface, context, tools, sessions) is 2,597 lines once you drop blank lines and comments. Counting tracing, evals, the outer CLI, config and packaging too, the whole package is 29 files: 5,357 physical lines, 4,594 net, every one short enough to read in a single sitting. The growth since the original 1,161-line snapshot went into visible features: plan mode, hooks, checkpoints, MCP, an optional Docker sandbox, effect-aware tool scheduling with live progress, model fallback, a USD budget, budget-aware context compaction, background/worktree sub-agents, and structured trace/eval, each documented below.
+The engine (loop, model interface, context, tools, sessions) is 3,202 lines once you drop blank lines and comments. Counting storage, Skills, tracing, evals, the outer CLI, config and packaging too, the whole package is 36 files: 8,119 physical lines, 7,124 net, every one short enough to read in a single sitting. The growth since the original 1,161-line snapshot went into visible features: plan mode, hooks, checkpoints, MCP, session-persistent Skills, Docker isolation for bash and MCP, per-tool capabilities, effect-aware tool scheduling with live progress, model fallback, a USD budget, budget-aware context compaction, dual-layer transactional session storage, structured task memory, background/worktree sub-agents, and structured trace/eval, each documented below.
 
-And it really runs: reads and writes files, executes shell, spawns foreground or background sub-agents, isolates them in Git worktrees when requested, compacts context in three tiers, and tells you the tokens and dollars a run burned whenever you ask. Anything that would mutate your disk or run a command stops for your consent first. The test suite now covers 228 cases. But the point of it running isn't to become your daily driver. It runs so the walkthrough can't lie: a reference that shows how an agent works has to actually work.
+And it really runs: reads and writes files, executes shell, loads project workflows on demand, keeps compactable chat history separate from persistent structured task memory, spawns foreground or background sub-agents, isolates them in Git worktrees when requested, compacts context in three tiers, autosaves resumable sessions, and tells you the tokens and dollars a run burned whenever you ask. Anything that would mutate your disk or run a command stops for your consent first. The test suite now covers 278 cases. But the point of it running isn't to become your daily driver. It runs so the walkthrough can't lie: a reference that shows how an agent works has to actually work.
 
 The code came out of a public teardown: open analyses have already exposed a lot of the load-bearing architecture inside production agents like Claude Code. I took the most essential layer and rewrote it honestly, in as little code as I could. So reading CoreCoder is roughly like reading a runnable, annotated take on how that kind of agent works, except it's only a minimal reimplementation, sitting right there on your machine for you to take apart and change.
 
@@ -95,39 +95,48 @@ Laid out flat, the whole project is this big. Skim it before you clone and you'l
 
 ```
 corecoder/
-├── agent.py        loop + scheduler + trace events        701 lines   ← start here
+├── agent.py        loop + scheduler + stable snapshots   1031 lines   ← start here
+├── capabilities.py per-Tool authority policy              163 lines
 ├── llm.py          stream + retry + fallback + budget     567 lines
 ├── context.py      request-budgeted context compaction    431 lines
-├── session.py      save / resume + path-traversal guard    97 lines
-├── permissions.py  consent for mutating tools             108 lines
-├── hooks.py        Pre/PostToolUse shell hooks             85 lines
-├── mcp.py          MCP stdio client for external tools    210 lines
-├── sandbox.py      local/Docker execution boundary        272 lines
+├── session.py      storage-compatible session facade      161 lines
+├── storage.py      Transcript + Active Context storage     790 lines
+├── memory.py       goal + constraints + plan + decisions   299 lines
+├── permissions.py  consent for mutating tools             111 lines
+├── hooks.py        Pre/PostToolUse shell hooks             88 lines
+├── protect_paths_hook.py  opt-in sensitive-path guard      118 lines
+├── mcp.py          host/Docker MCP stdio client           350 lines
+├── skills.py       project/user Skill discovery + parser  160 lines
+├── sandbox.py      local/Docker execution boundary        342 lines
 ├── trace.py        metadata-safe memory/JSONL event sinks  160 lines
-├── eval.py         repeatable cases, checks, and metrics   552 lines
+├── eval.py         repeatable cases, checks, and metrics   559 lines
 ├── prompt.py       system prompt                           41 lines
-├── cli.py          REPL + slash commands + one-shot       634 lines
-├── config.py       env-var config                          88 lines
+├── cli.py          REPL + slash commands + one-shot       961 lines
+├── config.py       env-var config                          94 lines
 ├── checkpoints.py  /undo snapshot and restore                44 lines
 ├── demo.py         offline end-to-end demo                 100 lines
 └── tools/
-    ├── bash.py       shell + execution backend + cd       169 lines
-    ├── edit.py       unique-match search/replace + diff   105 lines
-    ├── grep.py       content search                       112 lines
-    ├── glob_tool.py  filename matching                     65 lines
-    ├── read.py       file read                             65 lines
-    ├── write.py      file write                            52 lines
-    ├── todo.py       agent-maintained task checklist       80 lines
-    ├── agent.py      sub-agent modes + background jobs    432 lines
-    ├── fetch.py      bounded HTTP(S) text fetch             44 lines
-    ├── now.py        current local timestamp                20 lines
-    └── base.py       tool base + effect metadata            56 lines
+    ├── bash.py       shell + execution backend + cd       179 lines
+    ├── edit.py       unique-match search/replace + diff   107 lines
+    ├── grep.py       content search                       114 lines
+    ├── glob_tool.py  filename matching                     67 lines
+    ├── read.py       file read                             67 lines
+    ├── write.py      file write                            54 lines
+    ├── todo.py       agent-maintained task checklist       91 lines
+    ├── memory.py     structured task-state updates          83 lines
+    ├── agent.py      sub-agent modes + background jobs    447 lines
+    ├── fetch.py      bounded HTTP(S) text fetch             46 lines
+    ├── now.py        current local timestamp                21 lines
+    ├── skill.py      load + persistent activation state    119 lines
+    └── base.py       tool base + effect metadata            64 lines
+.corecoder/skills/
+└── corecoder-review/SKILL.md  repository-aware review workflow
 examples/
 ├── plan_hooks_demo.py  offline plan mode + hooks demo (no API key)
 └── eval_cases.json     starter evaluation manifest
 ```
 
-Eleven built-in tools: `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `todo_write`, `agent`, `agent_status`, `fetch_url`, and `now`. Everything else is the CLI shell, config, and packaging wrapped around that engine core. If `~/.corecoder/mcp.json` exists, its MCP servers join them as extra `mcp__*` tools; the MCP section below covers it.
+Twelve built-in tools: `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `todo_write`, `memory_update`, `agent`, `agent_status`, `fetch_url`, and `now`. When Skills are discovered, one read-only `load_skill` adapter joins them; it adds workflow instructions, not execution authority. If `~/.corecoder/mcp.json` exists, its MCP servers join as extra `mcp__*` tools.
 
 ## A `while` loop is the whole agent
 
@@ -166,11 +175,11 @@ I also wrote a bilingual source-reading series, one intro plus eight parts, each
 
 - **[Intro · Read Claude Code through CoreCoder, then build your own](article/00-index_EN.md)**
 - **[01 · An agent, at its core, is a `while` loop](article/01-the-loop_EN.md)** — the main loop in `agent.py`, interrupts, and the round limit
-- **[02 · The tool system: letting the model act, safely](article/02-tools_EN.md)** — the eleven tools in `tools/`, effect metadata, and the bash safety gate
+- **[02 · The tool system: letting the model act, safely](article/02-tools_EN.md)** — the built-in tools in `tools/`, effect metadata, and the bash safety gate
 - **[03 · Plug in any LLM, and keep the bill honest](article/03-llm-and-cost_EN.md)** — `llm.py`'s provider wrapper, retries, and cost accounting
 - **[04 · Surviving a long task on a finite window](article/04-context_EN.md)** — `context.py`'s three-tier compaction and orphaned tool messages
 - **[05 · Parallel execution and sub-agents](article/05-parallel-and-subagents_EN.md)** — effect-aware read concurrency and sub-agent isolation
-- **[06 · Turning it into a real command-line tool](article/06-session-and-cli_EN.md)** — `session.py` and path-traversal defense
+- **[06 · Turning it into a real command-line tool](article/06-session-and-cli_EN.md)** — CLI, transactional session storage, and crash-safe resume
 - **[07 · Fork CoreCoder into your own coding agent](article/07-build-your-own_EN.md)** — from fork to custom tools to swapping models
 - **[08 · Three ways to extend without touching the loop: MCP, hooks, and plan mode](article/08-extensibility_EN.md)** — the v0.6.0 extensibility trio and the contract that makes them safe
 
@@ -192,7 +201,7 @@ print(Agent(llm=llm).chat("find every TODO comment in this project and list them
 
 Going deeper, the directions are out in the open too. The Docker sandbox is now a small working baseline; the remaining items are still deliberate extension points:
 
-- **Harden the sandbox further.** `--sandbox docker` now supplies a real container boundary for `bash`, but production deployments can still add a custom seccomp/AppArmor profile, read-only workspace modes, per-task images, and isolation for hooks and MCP server processes.
+- **Harden the sandbox further.** `--sandbox docker` supplies a real container boundary for `bash`, and individual MCP servers can opt into the same hardened Docker runtime. Production deployments can still add custom seccomp/AppArmor profiles, per-task images, image signing/scanning, and isolation for hooks.
 - **Model resilience is deliberately explicit.** Retryable failures exhaust exponential backoff before advancing through the configured fallback chain; a successful switch stays active. The optional USD cap reserves the next input and clamps maximum output before sending, and refuses unknown pricing or missing usage. A production fork can extend this into health-based routing, per-provider credentials, and account-side billing alerts.
 - **Sub-agent modes are explicit but intentionally in-process.** Foreground/background and shared/worktree modes are implemented. Production forks can add durable workers, cancellation, event streaming, automatic merge/cherry-pick policy, and process/host isolation.
 - **Trace and eval are local, intentionally small building blocks.** JSONL captures one run precisely and the eval runner turns deterministic cases into success/latency/token/tool/cost metrics. Production forks can add OpenTelemetry export, a trace UI, semantic or model-graded checks, datasets, and CI trend storage.
@@ -208,15 +217,45 @@ Inside the REPL, `/help` lists everything; these are the ones you'll reach for:
 /model <name>    switch model
 /compact         compact the context by hand
 /tokens          token usage, active fallback, cost, and remaining budget
+/memory          show persistent structured task memory
+/goal <text>     set the task goal (`clear` removes it)
+/constraint <text>  add a user-owned semantic constraint
+/decision <text>    record a durable decision
 /diff            files changed this session
 /undo            revert the most recent file change
 /plan            toggle plan mode (read-only, then a plan to approve)
-/save  /sessions save / list sessions
+/save            force-save the active session
+/name <name>     name the active session without changing its stable ID
+/session         show the active session and storage
+/sessions        list saved sessions with names, IDs, and previews
+/skills          list project and user workflow skills
+/transcript      inspect original history unaffected by context compaction
+/delete-session  delete an inactive session by ID
 /agents          list background sub-agents
 quit / exit      exit (Ctrl+C cancels the current round)
 ```
 
-Session IDs are sanitized to safe characters before they become filenames, every archive lands under `~/.corecoder/sessions`, and a malicious session name can't traverse out.
+Interactive and one-shot runs autosave to `~/.corecoder/sessions/sessions.db` by default. `/name Fix login flow` assigns a human-facing name while the generated Session ID remains the stable, unique key used by `corecoder -r <id>`; names need not be unique. `/sessions` shows both, plus the first-message preview, so choosing a session no longer depends on remembering an opaque ID. Storage has two layers: `events` is an append-only Transcript preserving original user/assistant/tool-call/tool-result payloads, while `messages` is the Active Context used by Resume and the next model request and may be summarized or snipped by Context Management. A compressed context snapshot, the pending Transcript tail, and Session metadata commit in one transaction, so the model can run on short context while `/transcript` still shows the original history.
+
+SQLite WAL permits concurrent readers/writers. The Agent emits snapshots only at provider-valid boundaries: after a user message, after every complete tool-result batch, and on completion/failure/interruption. Resume therefore never exposes an Active Context with assistant `tool_calls` but missing observations. Compaction records also enter `summaries`, including actions, before/after token counts, model, and summary messages. `--no-autosave` disables automatic writes while keeping `/save`; `--storage PATH` or `CORECODER_STORAGE_PATH` selects another database. Existing v1/v2/JSON sessions are migrated on read; because already-compacted originals cannot be reconstructed, migrated records are explicitly marked as having an incomplete Transcript.
+
+Stored state includes the full Transcript, compressed Active Context, compaction summaries, structured task memory, model, workspace, status, token/cost counters, fallback usage, plan mode, todo state, active Skill records, and unconsumed Tool Result IDs. API keys and permission grants are deliberately excluded. Session IDs are still normalized before becoming database keys or legacy filenames, and SQLite/JSON files are created with user-only permissions where the OS permits it.
+
+The database is local but not encrypted. Messages and Tool Results can themselves contain source code, prompts, command output, or secrets read from the workspace; use `--no-autosave` for sensitive runs or point `--storage` at an appropriately protected location.
+
+## Structured task memory
+
+Conversation history is not the only state the model sees. `MemoryState` keeps a bounded Goal, user-owned Critical Constraints, Plan Steps, Decisions, and system-derived Files Modified outside `messages`; `Agent._full_messages()` re-injects it every round, and Session snapshots restore it after restart. Context summarization can therefore discard old prose without silently deleting the current goal or an explicit user constraint. The internal `memory_update` Tool lets the model maintain goals, plans, and decisions, but deliberately cannot promote Tool output into a Critical Constraint. Successful built-in file writes populate Files Modified from actual Tool arguments rather than trusting a model-written claim.
+
+Constraints in this layer are semantic instructions, not an operating-system boundary. Use `/constraint revoke <id>` to supersede one, and use Hooks, Capability Policy, Permission, or Sandbox when a rule must be mechanically enforced. Foreground/background sub-agents inherit copies of the parent constraints and decisions while keeping their own Plan and modified-file state, so child work cannot mutate parent memory by reference.
+
+## Skills
+
+Skills are reusable workflow instructions, deliberately separate from executable Tools. CoreCoder discovers user Skills under `~/.corecoder/skills/*/SKILL.md` and project Skills under `<workspace>/.corecoder/skills/*/SKILL.md`; a project Skill overrides a same-named user Skill. Startup exposes only each validated `name` and `description`. When a task matches, the model calls the read-only `load_skill` Tool and receives the full instructions as an ordinary Tool Result, so the Context Manager, Transcript, Trace, and sub-agent tool sharing continue to work without a second execution path.
+
+A successful load also creates a small session-persistent `active_skills` record containing the name, scope, load time, status, and SHA-256 content hash. The Agent re-injects hash-matched active instructions into the system message on every LLM request, so context compression and Resume cannot silently forget the workflow. The full instructions remain in `SKILL.md`, not duplicated in session metadata. If the file changes or disappears, CoreCoder fails closed: the old instructions are not injected and `/skills` reports `changed` or `unavailable`; call `load_skill` again to explicitly accept a changed version. `/reset` clears active Skills.
+
+This repository ships one natural example, `corecoder-review`: it reviews changes against the Agent Loop's protocol invariants, scheduling/permission/sandbox boundaries, context protection, and dual-layer Session rules. Type `/skills` to see what was discovered, then ask the model to use `corecoder-review`. A Skill never grants a missing Tool and never bypasses Permission or Sandbox; project Skills are repository-provided instructions, so review them before using an untrusted checkout.
 
 ## Tool progress
 
@@ -226,11 +265,36 @@ Embedders can drive another UI with the same structured stream by passing `on_to
 
 ## Permissions
 
-Read-only tools (`read_file`, `glob`, `grep`, `todo_write`, `now`, `agent_status`) run the moment the model asks. The mutating or externally active ones (`edit_file`, `write_file`, `bash`, `fetch_url`, MCP tools, and spawning a sub-agent) stop for consent first, and the REPL banner shows which mode you're in:
+Read-only and in-memory state tools (`read_file`, `glob`, `grep`, `todo_write`, `memory_update`, `now`, `agent_status`, `load_skill`) run the moment the model asks. The disk-mutating or externally active ones (`edit_file`, `write_file`, `bash`, `fetch_url`, MCP tools, and spawning a sub-agent) stop for consent first, and the REPL banner shows which mode you're in:
 
 - In the REPL you get one prompt per call: allow once, always allow this tool, or deny. Foreground sub-agents inherit that interactive layer. A background thread is never allowed to compete with the REPL for input: it can use only `--yes` or tools already marked "always allow"; other stateful calls fail closed and tell the child to route around them.
 - In one-shot mode (`-p`) there is nobody to ask, so a mutating call is refused on the spot and the refusal goes back to the model as an ordinary tool result: the loop never hangs on input that can't arrive. Pass `--yes` to approve everything up front (scripts, CI).
 - The decision itself is pure logic in `permissions.py`, with the terminal only supplying the prompt callback. You can unit-test consent without a TTY, or reuse the layer in your own embedding.
+
+## Per-tool capabilities
+
+Tools now declare the authority they may exercise: `filesystem_read`, `filesystem_write`, `network`, `process`, `subagent`, `mcp`, or `unknown`. An optional `~/.corecoder/capabilities.json` policy restricts that authority by exact Tool name or glob. It is checked after PreToolUse hooks and before Permission, so a denied capability never reaches a consent prompt or `Tool.execute()`:
+
+```json
+{
+  "default": "deny",
+  "tools": {
+    "read_file": {"allow": ["filesystem_read"]},
+    "bash": {"allow": ["filesystem_read", "filesystem_write", "process"]},
+    "fetch_url": {"allow": ["network"]},
+    "mcp__weather__*": {"allow": ["mcp", "process", "network"]}
+  }
+}
+```
+
+Use `--capability-policy PATH` or `CORECODER_CAPABILITY_POLICY`; `/capabilities` shows the active policy and each Tool's effective declaration. With no policy file, CoreCoder keeps the backward-compatible allow policy. Under `default: deny`, tools with no external authority (`now`, `agent_status`, todo, and structured memory state) still run, while unknown custom tools fail closed. The sample [examples/capabilities.json](examples/capabilities.json) is a fuller starting point.
+
+```bash
+corecoder --capability-policy examples/capabilities.json --sandbox docker
+# then type /capabilities in the REPL
+```
+
+Network policy is deliberately enforceable rather than heuristic. `fetch_url` declares `network`; local `bash` declares it because host processes can reach the network, while Docker `bash` drops it only when `--network none` actually removes that authority. A rule that omits `network` therefore blocks local/online bash entirely instead of pretending to identify which shell commands will connect. Domain allowlists are not claimed: arbitrary shell and MCP implementations can hide or redirect their true destination, so use a network-none container or an external allowlisting proxy for that boundary.
 
 ## Docker sandbox
 
@@ -245,11 +309,11 @@ Every bash call runs in a fresh container. Only the directory from which CoreCod
 
 The defaults can be changed with `CORECODER_SANDBOX*` environment variables or the matching CLI flags (`--sandbox-image`, `--sandbox-network`, `--sandbox-memory`, `--sandbox-cpus`, and `--sandbox-pids`). For example, `--sandbox-network bridge` explicitly grants container networking. A custom image only needs `/bin/sh` plus the runtimes your project requires.
 
-This boundary is deliberately scoped: hooks, MCP server processes, the LLM client, and `fetch_url` still run on the host, and the workspace mount is writable because this is a coding agent. Host environment variables are not forwarded, but every file already inside the workspace—including `.env` or credentials—is visible to the tools, so use a clean worktree and keep secrets outside it for untrusted tasks. Permission prompts are still required—they decide whether an action is authorized, while the sandbox limits the damage of an authorized or compromised shell command. If the Docker daemon or image is unavailable, the call fails as a tool result; it never falls back to host execution.
+This boundary is deliberately scoped: hooks, the LLM client, and `fetch_url` still run on the host; MCP servers run there too unless their own `sandbox` block selects Docker. The bash workspace mount is writable because this is a coding agent. Host environment variables are not forwarded, but every file already inside the workspace—including `.env` or credentials—is visible to the tools, so use a clean worktree and keep secrets outside it for untrusted tasks. Permission prompts are still required—they decide whether an action is authorized, while capability policy limits which kinds of authority a Tool may request and the sandbox limits the damage after authorization. If the Docker daemon or image is unavailable, the call fails as a tool result; it never falls back to host execution.
 
 ## Plan mode
 
-`/plan` toggles plan mode in the REPL. While it's on, the prompt shows `(plan)` and every mutating call (writes, edits, bash, MCP tools, sub-agents) is refused on the spot: the refusal goes back to the model as an ordinary tool result, telling it to keep investigating read-only and present a numbered plan instead. When the plan looks right, `approve` (or `/plan` again) hands control back and the agent executes. Mechanically it is one flag on the `Agent` plus one refusal branch ahead of the consent gate, which itself stays untouched; there is no plan file and nothing is remembered between sessions.
+`/plan` toggles plan mode in the REPL. While it's on, the prompt shows `(plan)` and every externally mutating call (writes, edits, bash, MCP tools, sub-agents) is refused on the spot: the refusal goes back to the model as an ordinary tool result, telling it to keep investigating read-only and present a numbered plan instead. The model may maintain structured Plan Steps through `memory_update`; those steps survive context compaction and Session Resume. When the plan looks right, `approve` (or `/plan` again) hands control back and the agent executes. Mechanically the execution restriction remains one flag on `Agent` plus a refusal branch ahead of the consent gate.
 
 ## Hooks
 
@@ -264,30 +328,38 @@ Drop a `hooks.json` under `~/.corecoder` and your own shell commands run around 
 
 Each hook gets the call as JSON on stdin (`tool_name`, `tool_input`; post hooks also get `tool_response`). The matcher is an exact tool name; empty or `*` fires on every tool. A pre hook can veto the call with exit code 2, and its stderr travels back to the model as the reason so it can route around the block. Post hooks only observe and can never block. A hook that errors or runs past ten seconds is skipped with a warning: hooks assist the loop, they never get to kill it. The whole mechanism is `hooks.py`, and the REPL banner shows how many hooks loaded.
 
-Two worth stealing (the commands lean on `jq`, the usual suspect):
+CoreCoder ships one opt-in practical hook. Install the editable package after
+pulling this version, then copy the sample only when you do not already have a
+hook file (otherwise merge its `PreToolUse` entry):
 
 ```bash
-# 1. lint gate: after every edit/write, run the project's fast linter on the
-#    touched file. The model sees the output and fixes its own mistakes in
-#    the same turn instead of waiting for CI.
-{
-  "PostToolUse": [{
-    "matcher": "edit",
-    "command": "f=$(jq -r .tool_input.path); ruff check \"$f\" 2>&1 | head -20"
-  }]
-}
+python -m pip install -e .
+mkdir -p ~/.corecoder
+cp examples/hooks.protect-sensitive.json ~/.corecoder/hooks.json
+```
 
-# 2. write protect: refuse edits under paths you never want an agent to
-#    touch. Exit code 2 vetoes the call and the message reaches the model.
+The sample uses `CORECODER_PYTHON`, which the Hook runtime sets to the exact
+interpreter running CoreCoder, so it does not accidentally invoke another
+virtual environment:
+
+```json
 {
   "PreToolUse": [{
-    "matcher": "edit",
-    "command": "case \"$(jq -r .tool_input.path)\" in .env*|*/secrets/*|*.pem) echo 'that path is off-limits' >&2; exit 2;; esac"
+    "matcher": "*",
+    "command": "\"$CORECODER_PYTHON\" -m corecoder.protect_paths_hook"
   }]
 }
 ```
 
-Both are plain shell; nothing here is CoreCoder-specific syntax beyond the JSON shape and the exit-code-2 veto.
+It refuses `write_file` and `edit_file` calls targeting common `.env` files,
+private-key extensions, `.git`, `secrets/`, or `production.yaml`/`production.yml`.
+It checks lexical, resolved, and workspace-relative path forms, so `..` and an
+existing symlink cannot disguise a protected target. Add a project rule with
+`corecoder-protect-paths --pattern 'config/prod/*'` (or add those arguments to
+the module command in JSON); use `--no-defaults` when
+you want only your own patterns. The hook deliberately does not inspect
+`bash`: arbitrary shell effects cannot be classified safely from command text,
+so use Capability Policy plus the Docker Sandbox for that boundary.
 
 ## MCP servers
 
@@ -301,7 +373,40 @@ Drop a `mcp.json` under `~/.corecoder` and tools from any MCP server join the ag
 }
 ```
 
-Each configured server starts as a subprocess at launch, handshakes, and lists its tools; every one is registered as `mcp__<server>__<tool>`, so hook matchers and the consent gate treat it exactly like a built-in. MCP tools stay out of the read-only set, meaning the agent asks before running one. The handshake gets fifteen seconds, a call gets sixty, and a server that dies or never answers fails that one call as an ordinary tool result instead of killing the loop. The client speaks the tools slice of the protocol (initialize, tools/list, tools/call) and nothing else, which keeps the whole thing inside `mcp.py` at about 200 lines. With no `mcp.json` there is no MCP and nothing changes.
+Each configured server starts as a subprocess at launch, handshakes, and lists its tools; every one is registered as `mcp__<server>__<tool>`, so hooks, capability policy, and consent treat it like a built-in. MCP tools stay out of the read-only set. The handshake gets fifteen seconds, a call gets sixty, and a server that dies or never answers fails that one call as an ordinary Tool Result instead of killing the loop. The client implements the tools slice (`initialize`, `tools/list`, `tools/call`). With no `mcp.json` there is no MCP and nothing changes.
+
+Host mode remains the compatibility default. A server can instead live in one long-running hardened Docker stdio container:
+
+```json
+{
+  "defaults": {
+    "sandbox": {
+      "mode": "docker",
+      "image": "my-mcp-runtime:latest",
+      "network": "none",
+      "workspace": "none",
+      "memory": "512m",
+      "cpus": 0.5,
+      "pids": 64
+    }
+  },
+  "mcpServers": {
+    "weather": {
+      "command": "weather-mcp-server",
+      "env": {"WEATHER_API_KEY": "replace-me"},
+      "sandbox": {"network": "bridge"}
+    },
+    "review": {
+      "command": "review-mcp-server",
+      "sandbox": {"workspace": "ro"}
+    }
+  }
+}
+```
+
+The executable must exist inside the selected image. Docker MCP gets the same read-only root, dropped Linux capabilities, no-new-privileges, non-root UID/GID, private `/tmp`, resource limits, `--pull never`, named-container timeout cleanup, and fail-closed startup as Docker bash. It inherits no host environment variables: only the explicit `env` map enters the container. Workspace access defaults to `none`; choose `ro` or `rw` explicitly, which mounts the CoreCoder startup directory at `/workspace`. Network defaults to `none`; `bridge` grants the whole server outbound network, including during startup. Since all tools from one MCP server share that process boundary, place tools with different trust/network requirements in separate servers or images.
+
+For a no-dependency end-to-end smoke test, copy [examples/mcp.sandbox.json](examples/mcp.sandbox.json) to `~/.corecoder/mcp.json`, start CoreCoder from this repository root, and ask it to call `mcp__sandbox_demo__echo`. The example runs [examples/minimal_mcp_server.py](examples/minimal_mcp_server.py) from a read-only Workspace mount with networking disabled.
 
 ## Trace and eval
 
@@ -349,7 +454,7 @@ If working through CoreCoder was useful, here are a few other tools I've built a
 
 ## Contributing / License
 
-Before you send anything, run `pytest tests/ -q` (228 cases), `ruff check`, and `compileall`, and make sure they're green. MIT licensed: fork it, learn from it, ship something better. A mention of this project is appreciated.
+Before you send anything, run `pytest tests/ -q` (278 cases), `ruff check`, and `compileall`, and make sure they're green. MIT licensed: fork it, learn from it, ship something better. A mention of this project is appreciated.
 
 ---
 

@@ -12,7 +12,9 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .corecoder_history
-.corecoder/
+.corecoder/*
+!.corecoder/skills/
+!.corecoder/skills/**
 .DS_Store
 .pytest_cache/
 .tmp/

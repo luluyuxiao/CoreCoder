@@ -104,6 +104,45 @@ def test_docker_executor_maps_nested_workdir(tmp_path):
     assert str(executor._container_path(nested)) == "/workspace/src/pkg"
 
 
+def test_docker_stdio_process_defaults_to_no_workspace_and_explicit_env(
+    tmp_path, monkeypatch
+):
+    executor = DockerCommandExecutor(tmp_path, image="mcp-weather:1", network="none")
+    process = mock.Mock()
+    monkeypatch.setenv("HOST_ONLY_SECRET", "must-not-enter-container")
+
+    with mock.patch("corecoder.sandbox.subprocess.Popen", return_value=process) as popen:
+        returned, name = executor.start_stdio_process(
+            "weather-server",
+            ["--stdio"],
+            env={"WEATHER_TOKEN": "secret"},
+        )
+
+    assert returned is process
+    assert name.startswith("corecoder-mcp-")
+    argv = popen.call_args.args[0]
+    assert "-i" in argv
+    assert "--mount" not in argv
+    assert argv[argv.index("--network") + 1] == "none"
+    assert argv[argv.index("--workdir") + 1] == "/tmp"
+    assert "WEATHER_TOKEN" in argv
+    assert "WEATHER_TOKEN=secret" not in argv
+    assert popen.call_args.kwargs["env"]["WEATHER_TOKEN"] == "secret"
+    assert not any("HOST_ONLY_SECRET" in item for item in argv)
+    assert argv[-4:] == ["--entrypoint", "weather-server", "mcp-weather:1", "--stdio"]
+
+
+def test_docker_stdio_process_can_mount_workspace_read_only(tmp_path):
+    executor = DockerCommandExecutor(tmp_path)
+    with mock.patch("corecoder.sandbox.subprocess.Popen", return_value=mock.Mock()) as popen:
+        executor.start_stdio_process("server", workspace_access="ro")
+
+    argv = popen.call_args.args[0]
+    mount = argv[argv.index("--mount") + 1]
+    assert mount == f"type=bind,src={tmp_path},dst=/workspace,readonly"
+    assert argv[argv.index("--workdir") + 1] == "/workspace"
+
+
 def test_docker_executor_rejects_workdir_outside_workspace(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

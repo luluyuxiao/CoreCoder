@@ -8,11 +8,19 @@ import concurrent.futures
 import json
 import logging
 import sys
+from unittest import mock
 
 import pytest
 
 from corecoder import mcp
 from corecoder.agent import Agent
+from corecoder.capabilities import (
+    FILESYSTEM_READ,
+    FILESYSTEM_WRITE,
+    MCP,
+    NETWORK,
+    PROCESS,
+)
 from corecoder.demo import ScriptedLLM
 from corecoder.hooks import Hooks
 from corecoder.llm import LLMResponse, ToolCall
@@ -105,6 +113,9 @@ def test_handshake_registers_each_remote_tool(mcp_config):
     echo = next(t for t in tools if t.name == "mcp__fake__echo")
     assert echo.description == "Echo text back"
     assert echo.effect == ToolEffect.UNKNOWN
+    assert echo.capabilities == frozenset({
+        MCP, PROCESS, NETWORK, FILESYSTEM_READ, FILESYSTEM_WRITE,
+    })
     assert echo.schema()["function"]["parameters"]["properties"]["text"] == {"type": "string"}
 
 
@@ -181,6 +192,91 @@ def test_an_unstartable_server_is_skipped_with_one_warning(tmp_path, caplog):
         assert load_mcp_tools(cfg) == []
     assert len(caplog.records) == 1
     assert "ghost" in caplog.records[0].getMessage()
+
+
+def test_mcp_config_passes_per_server_docker_sandbox(tmp_path):
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text(json.dumps({
+        "defaults": {
+            "sandbox": {
+                "mode": "docker",
+                "image": "mcp-base:1",
+                "network": "none",
+                "workspace": "none",
+            },
+        },
+        "mcpServers": {
+            "weather": {
+                "command": "weather-server",
+                "sandbox": {"network": "bridge"},
+            },
+        },
+    }), encoding="utf-8")
+    class StubClient:
+        def __init__(self, name, command, args=(), env=None, **kwargs):
+            self.name = name
+            self.tools = []
+            self.kwargs = kwargs
+
+        def close(self):
+            pass
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        created = []
+
+        def factory(*args, **kwargs):
+            client = StubClient(*args, **kwargs)
+            created.append(client)
+            return client
+
+        monkeypatch.setattr(mcp, "MCPClient", factory)
+        assert load_mcp_tools(cfg, workspace=tmp_path) == []
+
+    assert created[0].kwargs["sandbox"] == {
+        "mode": "docker",
+        "image": "mcp-base:1",
+        "network": "bridge",
+        "workspace": "none",
+    }
+    assert created[0].kwargs["workspace"] == tmp_path
+
+
+def test_docker_mcp_capabilities_match_enforced_boundary(tmp_path):
+    process = mock.Mock()
+    process.stdin = mock.Mock()
+    process.stdout = []
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    with (
+        mock.patch(
+            "corecoder.mcp.DockerCommandExecutor.start_stdio_process",
+            return_value=(process, "corecoder-mcp-test"),
+        ),
+        mock.patch.object(
+            mcp.MCPClient,
+            "_request",
+            side_effect=[{}, {"tools": []}],
+        ),
+        mock.patch.object(mcp.MCPClient, "_notify"),
+        mock.patch("corecoder.mcp.DockerCommandExecutor.remove_container") as remove,
+    ):
+        client = mcp.MCPClient(
+            "weather",
+            "weather-server",
+            sandbox={
+                "mode": "docker",
+                "network": "bridge",
+                "workspace": "ro",
+            },
+            workspace=tmp_path,
+        )
+        assert client.capabilities == frozenset({
+            MCP, PROCESS, NETWORK, FILESYSTEM_READ,
+        })
+        assert client.sandbox_mode == "docker"
+        client.close()
+
+    remove.assert_called_once_with("corecoder-mcp-test")
 
 
 def test_mcp_tools_sit_behind_the_consent_gate():

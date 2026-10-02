@@ -3,6 +3,8 @@
 import threading
 from abc import ABC, abstractmethod
 
+from ..capabilities import UNKNOWN
+
 
 class ToolEffect:
     """Coarse side-effect metadata used by the tool scheduler.
@@ -26,6 +28,8 @@ class Tool(ABC):
     description: str
     parameters: dict  # JSON Schema for the function args
     effect: str = ToolEffect.UNKNOWN
+    # Unknown/custom tools fail closed under a restrictive CapabilityPolicy.
+    capabilities: frozenset[str] = frozenset({UNKNOWN})
 
     @abstractmethod
     def execute(self, **kwargs) -> str:
@@ -46,6 +50,10 @@ class Tool(ABC):
     def is_concurrency_safe(self) -> bool:
         """Whether calls to this tool may share a parallel read batch."""
         return self.effect in {ToolEffect.PURE, ToolEffect.READ}
+
+    def required_capabilities(self, arguments: dict) -> frozenset[str]:
+        """Authority this call may exercise, checked before Permission."""
+        return self.capabilities
 
     def execution_lock(self):
         """Per-instance lock for unsafe tools shared by multiple Agents."""

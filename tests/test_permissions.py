@@ -173,6 +173,18 @@ def test_trace_flags_parse(monkeypatch):
     assert args.trace_content is True
 
 
+def test_storage_flags_parse(monkeypatch):
+    from corecoder.cli import _parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["corecoder", "--storage", "state/sessions.db", "--no-autosave"],
+    )
+    args = _parse_args()
+    assert args.storage == "state/sessions.db"
+    assert args.no_autosave is True
+
+
 def test_ask_prompt_maps_answers(monkeypatch):
     from corecoder import cli
     answers = iter(["y", "a", "n", "garbage"])

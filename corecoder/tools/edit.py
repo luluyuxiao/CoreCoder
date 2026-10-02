@@ -10,6 +10,7 @@ import difflib
 from pathlib import Path
 from typing import ClassVar
 
+from ..capabilities import FILESYSTEM_READ, FILESYSTEM_WRITE
 from ..checkpoints import record as _record_checkpoint
 from ..sandbox import WorkspacePathPolicy
 from .base import Tool, ToolEffect
@@ -21,6 +22,7 @@ _changed_files: set[str] = set()
 class EditFileTool(Tool):
     name = "edit_file"
     effect = ToolEffect.WRITE
+    capabilities = frozenset({FILESYSTEM_READ, FILESYSTEM_WRITE})
     description = (
         "Edit a file by replacing an exact string match. "
         "old_string must appear exactly once in the file for safety. "

@@ -9,6 +9,7 @@ from .base import Tool, ToolEffect
 class NowTool(Tool):
     name = "now"
     effect = ToolEffect.PURE
+    capabilities = frozenset()
     description = "Get the current local date and time. Use this when the user asks about the current time or you need a timestamp."
     parameters: ClassVar[dict] = {
         "type": "object",

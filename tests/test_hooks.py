@@ -143,3 +143,20 @@ def test_sub_agent_inherits_the_hooks(tmp_path):
 
     assert agent.chat("go") == "parent done"
     assert not target.exists()  # the veto followed the work into the sub-agent
+
+
+def test_bundled_sensitive_path_hook_blocks_file_mutation_before_consent(tmp_path):
+    target = tmp_path / ".env"
+    asked = []
+    command = '"$CORECODER_PYTHON" -m corecoder.protect_paths_hook'
+    agent = _agent(
+        tmp_path,
+        Hooks(pre=[{"matcher": "*", "command": command}], post=[]),
+        permission=Permission(ask=lambda name, arguments: asked.append(name) or "once"),
+    )
+    agent.llm._turns[0].tool_calls[0].arguments["file_path"] = str(target)
+
+    assert agent.chat("go") == "done"
+    assert not target.exists()
+    assert asked == []
+    assert "protected path" in agent.messages[2]["content"]

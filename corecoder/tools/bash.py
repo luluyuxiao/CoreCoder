@@ -13,6 +13,7 @@ import subprocess
 import threading
 from typing import ClassVar
 
+from ..capabilities import FILESYSTEM_READ, FILESYSTEM_WRITE, NETWORK, PROCESS
 from ..sandbox import CommandExecutor, LocalCommandExecutor, SandboxViolation
 from .base import Tool, ToolEffect
 
@@ -24,7 +25,10 @@ _local = threading.local()
 # patterns that could wreck the filesystem or leak secrets
 _DANGEROUS_PATTERNS = [
     # recursive delete aimed at root/home (force flag optional)
-    (r"\brm\s+(-\w*)?-r\w*\s+(/|~|\$HOME)", "recursive delete on home/root"),
+    (
+        r"\brm\b(?=[^;&|\n]*\s-[^\s]*[rR])[^;&|\n]*\s(?:/|~|\$HOME)(?:\s|$)",
+        "recursive delete on home/root",
+    ),
     # recursive (-r/-R) and force (-f) flags together, in any order or spacing
     (r"\brm\b(?=(?:.*\s)?-\w*[rR])(?=(?:.*\s)?-\w*f)", "force recursive delete"),
     # the same, written with long-form flags
@@ -63,6 +67,12 @@ class BashTool(Tool):
 
     def __init__(self, executor: CommandExecutor | None = None):
         self.executor = executor or LocalCommandExecutor()
+        capabilities = {FILESYSTEM_READ, FILESYSTEM_WRITE, PROCESS}
+        # Local commands can always attempt network access. Docker removes that
+        # capability only when its enforced network mode is exactly ``none``.
+        if self.executor.mode != "docker" or getattr(self.executor, "network", None) != "none":
+            capabilities.add(NETWORK)
+        self.capabilities = frozenset(capabilities)
         # Cwd is isolated both by BashTool instance and by worker thread.  This
         # prevents separate Agents in the same Python process from inheriting
         # one another's last `cd`, while retaining safe parallel tool calls.

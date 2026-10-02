@@ -12,6 +12,7 @@ minus `agent`.  Claude Code gives each sub-agent a list of its own; one
 shared list is what lets the whole pattern fit in a file this small.
 """
 
+import copy
 from typing import ClassVar
 
 from .base import Tool, ToolEffect
@@ -22,6 +23,7 @@ _VALID_STATUS = ("pending", "in_progress", "done")
 class TodoWriteTool(Tool):
     name = "todo_write"
     effect = ToolEffect.WRITE
+    capabilities = frozenset()
     description = (
         "Manage the session task checklist. Pass the complete list every time; it fully "
         "replaces the old one. Use it to plan multi-step work: write the list up front, "
@@ -78,3 +80,12 @@ class TodoWriteTool(Tool):
     def render(self) -> str:
         """The checklist as text; Agent injects this into the system context."""
         return "\n".join(f"{i}. [{t['status']}] {t['content']}" for i, t in enumerate(self._tasks, 1))
+
+    def snapshot(self) -> list[dict]:
+        """Return a detached representation suitable for session storage."""
+        return copy.deepcopy(self._tasks)
+
+    def restore(self, tasks: list[dict]) -> bool:
+        """Restore validated persisted state without exposing implementation details."""
+        result = self.execute(copy.deepcopy(tasks))
+        return not result.startswith("Error:")

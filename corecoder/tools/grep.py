@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import ClassVar
 
+from ..capabilities import FILESYSTEM_READ
 from ..sandbox import WorkspacePathPolicy
 from .base import Tool, ToolEffect
 
@@ -14,6 +15,7 @@ _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", "d
 class GrepTool(Tool):
     name = "grep"
     effect = ToolEffect.READ
+    capabilities = frozenset({FILESYSTEM_READ})
     description = (
         "Search file contents with regex. "
         "Returns matching lines with file path and line number."

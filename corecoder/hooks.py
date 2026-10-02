@@ -13,7 +13,9 @@ a warning: hooks assist the loop, they never get to kill it.
 
 import json
 import logging
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -75,6 +77,7 @@ def _fire(hook: dict, payload: dict):
         proc = subprocess.run(
             hook["command"], shell=True, check=False, input=json.dumps(payload),
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT,
+            env={**os.environ, "CORECODER_PYTHON": sys.executable},
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         log.warning("hook skipped (%s): %s", e.__class__.__name__, hook["command"])

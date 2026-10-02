@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import ClassVar
 
+from ..capabilities import FILESYSTEM_WRITE
 from ..checkpoints import record as _record_checkpoint
 from ..sandbox import WorkspacePathPolicy
 from .base import Tool, ToolEffect
@@ -12,6 +13,7 @@ from .edit import _changed_files
 class WriteFileTool(Tool):
     name = "write_file"
     effect = ToolEffect.WRITE
+    capabilities = frozenset({FILESYSTEM_WRITE})
     description = (
         "Create a new file or completely overwrite an existing one. "
         "For small edits to existing files, prefer edit_file instead."

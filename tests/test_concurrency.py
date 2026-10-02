@@ -166,6 +166,7 @@ def test_builtin_tools_declare_conservative_effects():
     assert effects["write_file"] == ToolEffect.WRITE
     assert effects["edit_file"] == ToolEffect.WRITE
     assert effects["todo_write"] == ToolEffect.WRITE
+    assert effects["memory_update"] == ToolEffect.WRITE
     assert effects["bash"] == ToolEffect.EXTERNAL
     assert effects["fetch_url"] == ToolEffect.EXTERNAL
     assert effects["agent"] == ToolEffect.EXTERNAL

@@ -25,13 +25,24 @@ from rich.progress import (
 
 from . import __version__
 from .agent import Agent
+from .capabilities import load_capability_policy
 from .config import Config
 from .hooks import load_hooks
 from .llm import LLM, LiteLLM
 from .mcp import load_mcp_tools
 from .permissions import Permission
 from .sandbox import WorkspacePathPolicy, create_command_executor
-from .session import list_sessions, load_session, save_session
+from .session import (
+    SessionStore,
+    create_session_store,
+    delete_session,
+    list_sessions,
+    load_session_record,
+    load_transcript,
+    new_session_id,
+    save_snapshot,
+)
+from .skills import SkillRegistry
 from .tools import build_tools
 from .trace import JsonlTrace
 
@@ -227,6 +238,21 @@ def _parse_args():
         action="store_true",
         help="Include prompts and tool payloads in traces (may contain secrets)",
     )
+    p.add_argument(
+        "--storage",
+        metavar="PATH",
+        help="SQLite session database (default: ~/.corecoder/sessions/sessions.db)",
+    )
+    p.add_argument(
+        "--no-autosave",
+        action="store_true",
+        help="Disable stable-state session autosave; /save still works",
+    )
+    p.add_argument(
+        "--capability-policy",
+        metavar="PATH",
+        help="Per-tool capability policy JSON (default: ~/.corecoder/capabilities.json)",
+    )
     p.add_argument("--demo", action="store_true", help="Run the offline scripted demo (no API key needed)")
     p.add_argument("-r", "--resume", metavar="ID", help="Resume a saved session")
     p.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
@@ -269,6 +295,12 @@ def main():
         config.trace_path = args.trace
     if args.trace_content:
         config.trace_content = True
+    if args.storage:
+        config.storage_path = args.storage
+    if args.no_autosave:
+        config.autosave = False
+    if args.capability_policy:
+        config.capability_policy_path = args.capability_policy
 
     if not config.api_key:
         console.print("[red bold]No API key found.[/]")
@@ -313,6 +345,11 @@ def main():
     except ValueError as e:
         console.print(f"[red bold]Invalid sandbox configuration:[/] {e}")
         sys.exit(2)
+    try:
+        capability_policy = load_capability_policy(config.capability_policy_path)
+    except (OSError, TypeError, ValueError) as e:
+        console.print(f"[red bold]Invalid capability policy:[/] {e}")
+        sys.exit(2)
     path_policy = WorkspacePathPolicy(Path.cwd()) if config.sandbox == "docker" else None
     # consent layer: ask in the REPL, refuse in one-shot mode, --yes skips it
     if args.yes:
@@ -331,28 +368,60 @@ def main():
         except OSError as e:
             console.print(f"[red bold]Cannot open trace file:[/] {e}")
             sys.exit(2)
+
+    session_store = None
+    resumed = None
+    if config.autosave or args.resume:
+        try:
+            session_store = create_session_store(config.storage_path)
+            resumed = (
+                load_session_record(args.resume, store=session_store)
+                if args.resume else None
+            )
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red bold]Cannot open session storage:[/] {e}")
+            sys.exit(2)
+    if args.resume and resumed is None:
+        console.print(f"[red]Session '{args.resume}' not found.[/red]")
+        sys.exit(1)
+    session_id = resumed.id if resumed is not None else new_session_id()
+    skill_registry = SkillRegistry.discover(Path.cwd())
+
+    def persist_snapshot(snapshot: dict):
+        assert session_store is not None  # autosave always initializes it above
+        save_snapshot(session_id, snapshot, store=session_store)
+
     agent = Agent(
         llm=llm,
-        tools=[*build_tools(executor=executor, path_policy=path_policy), *load_mcp_tools()],
+        tools=[
+            *build_tools(
+                executor=executor,
+                path_policy=path_policy,
+                skill_registry=skill_registry,
+            ),
+            *load_mcp_tools(workspace=Path.cwd()),
+        ],
         max_context_tokens=config.max_context_tokens,
         permission=permission,
         hooks=load_hooks(),
         trace=trace,
+        state_callback=persist_snapshot if config.autosave else None,
+        capability_policy=capability_policy,
     )
 
     # resume saved session
-    if args.resume:
-        loaded = load_session(args.resume)
-        if loaded:
-            agent.messages, loaded_model = loaded
-            # restore the model from the saved session unless overridden by CLI
-            if not args.model:
-                agent.llm.model = loaded_model
-                config.model = loaded_model
-            console.print(f"[green]Resumed session: {args.resume} (model: {agent.llm.model})[/green]")
-        else:
-            console.print(f"[red]Session '{args.resume}' not found.[/red]")
-            sys.exit(1)
+    if resumed is not None:
+        agent.restore_state(resumed.to_snapshot(), restore_model=not bool(args.model))
+        config.model = agent.llm.model
+        console.print(
+            f"[green]Resumed session: {resumed.id} "
+            f"(model: {agent.llm.model}, status: {resumed.status})[/green]"
+        )
+        if resumed.workspace and Path(resumed.workspace).resolve() != Path.cwd().resolve():
+            console.print(
+                f"[yellow]Session workspace was {resumed.workspace}; "
+                f"current workspace is {Path.cwd()}.[/yellow]"
+            )
 
     # one-shot mode
     if args.prompt:
@@ -360,7 +429,7 @@ def main():
         return
 
     # interactive REPL
-    _repl(agent, config)
+    _repl(agent, config, session_store, session_id, skill_registry)
 
 
 def _ask_permission(tool_name: str, arguments: dict) -> str:
@@ -411,11 +480,39 @@ def _run_once(agent: Agent, prompt: str):
     print()
 
 
-def _repl(agent: Agent, config: Config):
+def _repl(
+    agent: Agent,
+    config: Config,
+    session_store: SessionStore | None = None,
+    session_id: str | None = None,
+    skill_registry: SkillRegistry | None = None,
+):
     """Interactive read-eval-print loop."""
+    session_id = session_id or new_session_id()
+
+    def active_store() -> SessionStore:
+        nonlocal session_store
+        if session_store is None:
+            session_store = create_session_store(config.storage_path)
+        return session_store
+
     perm = agent.permission
     mode = "auto-approve every tool call (--yes)" if (perm and perm.allow_all) else "ask before mutating tools"
     mcp_count = sum(1 for t in agent.tools if t.name.startswith("mcp__"))
+    mcp_clients = {
+        id(t._client): t._client
+        for t in agent.tools
+        if t.name.startswith("mcp__") and hasattr(t, "_client")
+    }
+    mcp_modes = {
+        sandbox_mode: sum(
+            client.sandbox_mode == sandbox_mode for client in mcp_clients.values()
+        )
+        for sandbox_mode in ("docker", "host")
+    }
+    mcp_mode_text = ", ".join(
+        f"{count} {mode}" for mode, count in mcp_modes.items() if count
+    )
     console.print(Panel(
         f"[bold]CoreCoder[/bold] v{__version__}\n"
         f"Model: [cyan]{config.model}[/cyan]"
@@ -437,11 +534,29 @@ def _repl(agent: Agent, config: Config):
         )
         + (f"\nHooks: [cyan]{len(agent.hooks.pre)} pre, {len(agent.hooks.post)} post[/cyan]"
            " from ~/.corecoder/hooks.json" if agent.hooks else "")
-        + (f"\nMCP: [cyan]{mcp_count} tools[/cyan] from ~/.corecoder/mcp.json" if mcp_count else "")
+        + (
+            f"\nMCP: [cyan]{mcp_count} tools[/cyan] from {len(mcp_clients)} servers "
+            f"[dim]({mcp_mode_text})[/dim]"
+            if mcp_count else ""
+        )
+        + (
+            f"\nSkills: [cyan]{len(skill_registry)} available[/cyan]"
+            if skill_registry else ""
+        )
+        + (
+            f"\nCapabilities: [cyan]{agent.capability_policy.source}[/cyan] "
+            f"(default {agent.capability_policy.default})"
+            if agent.capability_policy.enabled else ""
+        )
         + (
             f"\nTrace: [cyan]{config.trace_path}[/cyan]"
             + (" [yellow](content included)[/yellow]" if config.trace_content else " [dim](metadata only)[/dim]")
             if config.trace_path else ""
+        )
+        + (
+            f"\nSession: [cyan]{session_id}[/cyan] "
+            f"[dim]({'autosave' if config.autosave else 'manual save'} → "
+            f"{getattr(session_store, 'path', 'on-demand store')})[/dim]"
         )
         + "\nType [bold]/help[/bold] for commands, [bold]Ctrl+C[/bold] to cancel, [bold]quit[/bold] to exit.",
         border_style="blue",
@@ -489,6 +604,7 @@ def _repl(agent: Agent, config: Config):
             continue
         if user_input == "/plan":
             agent.plan_mode = not agent.plan_mode
+            agent.persist_state("completed")
             if agent.plan_mode:
                 console.print(
                     "[yellow]Plan mode on.[/yellow] The agent can look but not touch: it will "
@@ -524,30 +640,149 @@ def _repl(agent: Agent, config: Config):
             if new_model:
                 agent.llm.model = new_model
                 config.model = new_model
+                agent.persist_state("completed")
                 console.print(f"Switched to [cyan]{new_model}[/cyan]")
             else:
                 console.print(f"Current model: [cyan]{agent.llm.model}[/cyan]")
+            continue
+        if user_input == "/memory":
+            rendered = agent.memory.render()
+            console.print(
+                Panel(escape(rendered), title="Structured Memory")
+                if rendered else "[dim]Structured memory is empty.[/dim]"
+            )
+            continue
+        if user_input == "/goal" or user_input.startswith("/goal "):
+            content = user_input[len("/goal "):].strip() if user_input.startswith("/goal ") else ""
+            if not content:
+                console.print(
+                    f"Goal: [cyan]{escape(agent.memory.goal)}[/cyan]"
+                    if agent.memory.goal else "[dim]No goal is set.[/dim]"
+                )
+            elif content.lower() == "clear":
+                agent.memory.clear_goal()
+                agent.persist_state("completed")
+                console.print("[green]Goal cleared.[/green]")
+            else:
+                try:
+                    agent.memory.set_goal(content)
+                except ValueError as error:
+                    console.print(f"[yellow]Goal not changed: {escape(str(error))}[/yellow]")
+                else:
+                    agent.persist_state("completed")
+                    console.print(f"[green]Goal set: {escape(agent.memory.goal)}[/green]")
+            continue
+        if user_input == "/constraint" or user_input.startswith("/constraint "):
+            content = (
+                user_input[len("/constraint "):].strip()
+                if user_input.startswith("/constraint ") else ""
+            )
+            if not content:
+                items = agent.memory.constraints
+                if not items:
+                    console.print("[dim]No persistent constraints.[/dim]")
+                for item in items:
+                    console.print(
+                        f"  [cyan]{item['id']}[/cyan] [{item['status']}] "
+                        f"{escape(item['content'])} [dim](semantic)[/dim]"
+                    )
+            elif content.startswith("revoke "):
+                constraint_id = content[len("revoke "):].strip()
+                if agent.memory.revoke_constraint(constraint_id):
+                    agent.persist_state("completed")
+                    console.print(f"[green]Constraint revoked: {escape(constraint_id)}[/green]")
+                else:
+                    console.print(f"[yellow]Active constraint not found: {escape(constraint_id)}[/yellow]")
+            else:
+                try:
+                    item = agent.memory.add_constraint(content)
+                except ValueError as error:
+                    console.print(f"[yellow]Constraint not added: {escape(str(error))}[/yellow]")
+                else:
+                    agent.persist_state("completed")
+                    console.print(
+                        f"[green]Constraint added: {item['id']}[/green] "
+                        "[dim](semantic; use Hook/Capability/Sandbox for enforcement)[/dim]"
+                    )
+            continue
+        if user_input == "/decision" or user_input.startswith("/decision "):
+            content = (
+                user_input[len("/decision "):].strip()
+                if user_input.startswith("/decision ") else ""
+            )
+            if not content:
+                if not agent.memory.decisions:
+                    console.print("[dim]No decisions recorded.[/dim]")
+                for item in agent.memory.decisions:
+                    console.print(f"  [cyan]{item['id']}[/cyan] {escape(item['content'])}")
+            else:
+                try:
+                    item = agent.memory.add_decision(content, source="user")
+                except ValueError as error:
+                    console.print(f"[yellow]Decision not added: {escape(str(error))}[/yellow]")
+                else:
+                    agent.persist_state("completed")
+                    console.print(f"[green]Decision recorded: {item['id']}[/green]")
             continue
         if user_input == "/compact":
             compressed, before, after = agent.compress_context()
             if compressed:
                 console.print(f"[green]Compressed: {before} → {after} tokens ({len(agent.messages)} messages)[/green]")
+                agent.persist_state("completed")
             else:
                 console.print(f"[dim]Nothing to compress ({before} tokens, {len(agent.messages)} messages)[/dim]")
             continue
         if user_input == "/save":
-            sid = save_session(agent.messages, agent.llm.model)
+            snapshot = agent.state_snapshot("saved")
+            sid = save_snapshot(
+                session_id,
+                snapshot,
+                store=active_store(),
+            )
+            agent.acknowledge_persisted(snapshot)
             console.print(f"[green]Session saved: {sid}[/green]")
             console.print(f"Resume with: corecoder -r {sid}")
             continue
+        if user_input == "/name" or user_input.startswith("/name "):
+            requested_name = (
+                user_input[len("/name "):].strip()
+                if user_input.startswith("/name ")
+                else ""
+            )
+            if not requested_name:
+                record = active_store().load(session_id)
+                current_name = record.name if record is not None else ""
+                console.print(
+                    f"Session name: [cyan]{escape(current_name)}[/cyan]"
+                    if current_name else "[dim]This session has no name yet.[/dim]"
+                )
+                continue
+            snapshot = agent.state_snapshot("saved")
+            snapshot["name"] = requested_name
+            save_snapshot(session_id, snapshot, store=active_store())
+            agent.acknowledge_persisted(snapshot)
+            record = active_store().load(session_id)
+            saved_name = record.name if record is not None else requested_name
+            console.print(f"[green]Session named: {escape(saved_name)}[/green]")
+            continue
+        if user_input == "/session":
+            mode_label = "autosave" if config.autosave else "manual save"
+            record = active_store().load(session_id)
+            name = record.name if record is not None else ""
+            console.print(
+                f"Session: [cyan]{session_id}[/cyan]  status: [cyan]{mode_label}[/cyan]\n"
+                f"Name: [cyan]{escape(name) if name else '(unnamed)'}[/cyan]\n"
+                f"Storage: [dim]{getattr(active_store(), 'path', 'custom store')}[/dim]"
+            )
+            continue
         if user_input == "/diff":
-            from .tools.edit import _changed_files
-            if not _changed_files:
+            changed_files = agent.memory.files_modified
+            if not changed_files:
                 console.print("[dim]No files modified this session.[/dim]")
             else:
-                console.print(f"[bold]Files modified this session ({len(_changed_files)}):[/bold]")
-                for f in sorted(_changed_files):
-                    console.print(f"  [cyan]{f}[/cyan]")
+                console.print(f"[bold]Files modified this session ({len(changed_files)}):[/bold]")
+                for file_path in sorted(changed_files):
+                    console.print(f"  [cyan]{escape(file_path)}[/cyan]")
             continue
         if user_input == "/undo":
             from .checkpoints import pending, undo
@@ -557,12 +792,94 @@ def _repl(agent: Agent, config: Config):
                 console.print(f"[dim]{left} more checkpoint(s) on the stack.[/dim]")
             continue
         if user_input == "/sessions":
-            sessions = list_sessions()
+            sessions = list_sessions(store=active_store())
             if not sessions:
                 console.print("[dim]No saved sessions.[/dim]")
             else:
                 for s in sessions:
-                    console.print(f"  [cyan]{s['id']}[/cyan] ({s['model']}, {s['saved_at']}) {s['preview']}")
+                    name = escape(s["name"]) if s["name"] else "(unnamed)"
+                    console.print(
+                        f"  [bold]{name}[/bold]  [cyan]{s['id']}[/cyan]\n"
+                        f"    ({escape(s['model'])}, {s['status']}, {s['saved_at']}) "
+                        f"{escape(s['preview'])}"
+                    )
+            continue
+        if user_input == "/skills":
+            states = agent.active_skill_states()
+            if not skill_registry:
+                console.print("[dim]No skills discovered.[/dim]")
+            else:
+                console.print("[bold]Available skills:[/bold]")
+                for name in skill_registry.names():
+                    skill = skill_registry.get(name)
+                    status = states.get(name, {}).get("status")
+                    marker = (
+                        f" [yellow][{status}][/]" if status else ""
+                    )
+                    console.print(
+                        f"  [cyan]{name}[/cyan] [dim]({skill.scope})[/dim]{marker} "
+                        f"{escape(skill.description)}"
+                    )
+            unavailable = [
+                name for name, state in states.items()
+                if state.get("status") == "unavailable"
+            ]
+            if unavailable:
+                console.print(
+                    "[yellow]Saved but unavailable:[/] " + ", ".join(unavailable)
+                )
+            continue
+        if user_input == "/capabilities":
+            policy = agent.capability_policy
+            source = str(policy.source) if policy.source else "built-in allow policy"
+            console.print(
+                f"[bold]Capability policy:[/] {escape(source)} "
+                f"[dim](default {policy.default})[/dim]"
+            )
+            for tool in agent.tools:
+                required = sorted(tool.capabilities)
+                console.print(
+                    f"  [cyan]{tool.name}[/cyan]: "
+                    + (", ".join(required) if required else "[dim]none[/dim]")
+                )
+            continue
+        if user_input == "/transcript" or user_input.startswith("/transcript "):
+            target = (
+                user_input[len("/transcript "):].strip()
+                if user_input.startswith("/transcript ")
+                else session_id
+            )
+            events = load_transcript(target, store=active_store())
+            if not events:
+                console.print(f"[dim]No transcript events for {target}.[/dim]")
+            else:
+                console.print(
+                    f"[bold]Transcript: {target} ({len(events)} events)[/bold]"
+                )
+                for event in events:
+                    payload = event.get("payload") or {}
+                    content = str(payload.get("content") or "").replace("\n", " ")
+                    if not content and payload.get("tool_calls"):
+                        names = [
+                            str((call.get("function") or {}).get("name") or "tool")
+                            for call in payload["tool_calls"]
+                        ]
+                        content = "tool calls: " + ", ".join(names)
+                    if len(content) > 180:
+                        content = content[:177] + "..."
+                    console.print(
+                        f"  [cyan]{event['sequence']:>4}[/cyan] "
+                        f"[dim]{event['event_type']}[/dim] {escape(content)}"
+                    )
+            continue
+        if user_input.startswith("/delete-session "):
+            target = user_input[len("/delete-session "):].strip()
+            if target == session_id:
+                console.print("[yellow]Cannot delete the active session.[/yellow]")
+            elif delete_session(target, store=active_store()):
+                console.print(f"[green]Deleted session: {target}[/green]")
+            else:
+                console.print(f"[yellow]Session not found: {target}[/yellow]")
             continue
         if user_input == "/agents":
             status_tool = next((t for t in agent.tools if t.name == "agent_status"), None)
@@ -612,12 +929,22 @@ def _show_help():
         "  /model         Show current model\n"
         "  /model <name>  Switch model mid-conversation\n"
         "  /tokens        Show token usage\n"
+        "  /memory        Show structured goal, constraints, plan, and decisions\n"
+        "  /goal <text>   Set the persistent task goal (use 'clear' to remove)\n"
+        "  /constraint <text>  Add a persistent semantic constraint\n"
+        "  /decision <text>    Record a durable task decision\n"
         "  /compact       Compress conversation context\n"
         "  /diff          Show files modified this session\n"
         "  /undo          Revert the most recent file change\n"
         "  /plan          Toggle plan mode: read-only, then a plan to approve\n"
-        "  /save          Save session to disk\n"
+        "  /save          Save the active session now\n"
+        "  /name <name>   Name the active session for easier resume\n"
+        "  /session       Show active session and storage\n"
         "  /sessions      List saved sessions\n"
+        "  /skills        List workflow skills and active state\n"
+        "  /capabilities  Show Tool capabilities and active policy\n"
+        "  /transcript [id]  Show the append-only original event history\n"
+        "  /delete-session <id>  Delete an inactive session\n"
         "  /agents        List background sub-agents\n"
         "  quit           Exit CoreCoder\n"
         "\n"

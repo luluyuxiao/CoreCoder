@@ -3,12 +3,14 @@
 import urllib.request
 from typing import ClassVar
 
+from ..capabilities import NETWORK
 from .base import Tool, ToolEffect
 
 
 class FetchUrlTool(Tool):
     name = "fetch_url"
     effect = ToolEffect.EXTERNAL
+    capabilities = frozenset({NETWORK})
     description = (
         "Fetch the text content of an http(s) URL. "
         "Use this to read documentation, API responses, or web pages."

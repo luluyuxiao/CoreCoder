@@ -18,13 +18,17 @@ import time
 import uuid
 from pathlib import Path
 
+from .capabilities import CapabilityPolicy
 from .context import ContextManager, estimate_request_tokens, estimate_tokens
 from .llm import LLM
+from .memory import MemoryState
 from .permissions import Permission
 from .prompt import PLAN_MODE_PROMPT, system_prompt
 from .tools import build_tools
 from .tools.agent import AgentStatusTool, AgentTool
 from .tools.base import Tool
+from .tools.memory import MemoryUpdateTool
+from .tools.skill import LoadSkillTool
 from .tools.todo import TodoWriteTool
 from .trace import NULL_TRACE, TraceSink
 
@@ -46,6 +50,9 @@ class Agent:
         parent_agent_id: str | None = None,
         agent_id: str | None = None,
         subagent_task_id: str | None = None,
+        state_callback=None,
+        capability_policy: CapabilityPolicy | None = None,
+        memory_state: MemoryState | None = None,
     ):
         self.llm = llm
         self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
@@ -53,8 +60,22 @@ class Agent:
         self.agent_id = agent_id or uuid.uuid4().hex[:12]
         self.parent_agent_id = parent_agent_id
         self.subagent_task_id = subagent_task_id
+        # Optional storage-neutral callback. The Agent emits only complete,
+        # provider-valid snapshots; the CLI decides whether SQLite, JSON, or
+        # another backend receives them.
+        self._state_callback = state_callback
+        # Transcript events are independent from ``messages``.  Context
+        # management may destructively summarize ``messages`` for the next
+        # model request, while these pending events preserve the original
+        # user/assistant/tool payloads until durable storage acknowledges them.
+        self._pending_transcript_events: list[dict] = []
+        self._pending_context_summaries: list[dict] = []
         self._active_run_id: str | None = None
         self._active_round: int | None = None
+        self.memory = (
+            MemoryState.from_dict(memory_state.to_dict())
+            if memory_state is not None else MemoryState()
+        )
         # Sub-agents share one LLM and its usage/budget counters. Serializing
         # calls keeps that mutable accounting correct while tool phases can
         # still overlap in background mode.
@@ -62,7 +83,16 @@ class Agent:
         self.tools = tools if tools is not None else build_tools()
         self.permission = permission
         self.hooks = hooks
+        self.capability_policy = capability_policy or CapabilityPolicy()
         self._tool_by_name = {t.name: t for t in self.tools}
+        self._skill_loader = next(
+            (t for t in self.tools if isinstance(t, LoadSkillTool)), None
+        )
+        # Skill runtime state is separate from conversation messages so context
+        # compression cannot silently deactivate a loaded workflow. Only a
+        # name/hash/state record is persisted; instructions are re-read from
+        # the validated registry on every model request.
+        self.active_skills: dict[str, dict] = {}
         self.messages: list[dict] = []
         self.context = ContextManager(max_tokens=max_context_tokens)
         # A tool observation is protected from ordinary history snipping until
@@ -87,6 +117,8 @@ class Agent:
         for t in self.tools:
             if isinstance(t, (AgentTool, AgentStatusTool)):
                 t._parent_agent = self
+            if isinstance(t, MemoryUpdateTool):
+                t.bind(self.memory)
             if not t.is_concurrency_safe():
                 t.execution_lock()  # create before any background worker can share it
 
@@ -98,13 +130,68 @@ class Agent:
         # between turns takes effect on the very next request
         if self.plan_mode:
             system += "\n\n" + PLAN_MODE_PROMPT
+        structured_memory = self.memory.render()
+        if structured_memory:
+            system += "\n\n" + structured_memory
         # the task list is re-injected every round, so the model always sees the
         # current state rather than a stale copy buried in old tool results
         if self._todo is not None:
             rendered = self._todo.render()
             if rendered:
                 system += "\n\n# Current task list\n" + rendered
+        skill_prompt = self._active_skill_prompt()
+        if skill_prompt:
+            system += "\n\n" + skill_prompt
         return [{"role": "system", "content": system}] + self.messages
+
+    def _reconcile_active_skills(self):
+        """Fail closed when a saved Skill disappeared or changed on disk."""
+        if self._skill_loader is None:
+            for name, record in self.active_skills.items():
+                record.update({"name": name, "status": "unavailable"})
+            return
+        self.active_skills = {
+            name: self._skill_loader.reconcile_activation(name, record)
+            for name, record in self.active_skills.items()
+        }
+
+    def _active_skill_prompt(self) -> str:
+        self._reconcile_active_skills()
+        if not self.active_skills:
+            return ""
+        if self._skill_loader is None:
+            names = ", ".join(sorted(self.active_skills))
+            return (
+                "# Saved Skill state notices\n\n"
+                "Saved Skills are unavailable because this Agent has no load_skill "
+                f"tool: {names}."
+            )
+        return self._skill_loader.render_active(self.active_skills)
+
+    def active_skill_states(self) -> dict[str, dict]:
+        """Return validated, JSON-safe Skill state for UI and library callers."""
+        self._reconcile_active_skills()
+        return copy.deepcopy(self.active_skills)
+
+    def _activate_skill_from_result(self, tc, result: str):
+        tool = self._tool_by_name.get(tc.name)
+        if not isinstance(tool, LoadSkillTool):
+            return
+        name = tc.arguments.get("name")
+        if not isinstance(name, str):
+            return
+        record = tool.activation_record(name, result)
+        if record is None:
+            return
+        replaced = name in self.active_skills
+        self.active_skills[name] = record
+        self._trace(
+            "skill.activated",
+            skill_name=name,
+            skill_scope=record["scope"],
+            content_hash=record["content_hash"],
+            replaced=replaced,
+        )
 
     def _tool_schemas(self) -> list[dict]:
         return [t.schema() for t in self.tools]
@@ -145,6 +232,9 @@ class Agent:
                 duration_ms=round((time.perf_counter() - started) * 1000, 3),
                 error_type=type(e).__name__,
             )
+            self.persist_state(
+                "interrupted" if isinstance(e, KeyboardInterrupt) else "failed"
+            )
             self._active_run_id = previous_run_id
             self._active_round = previous_round
             raise
@@ -154,6 +244,9 @@ class Agent:
             result_chars=len(result),
             outcome="max_rounds" if result == "(reached maximum tool-call rounds)" else "success",
             **self._trace_content(result=result),
+        )
+        self.persist_state(
+            "max_rounds" if result == "(reached maximum tool-call rounds)" else "completed"
         )
         self._active_run_id = previous_run_id
         self._active_round = previous_round
@@ -166,7 +259,8 @@ class Agent:
         on_tool=None,
         on_tool_progress=None,
     ) -> str:
-        self.messages.append({"role": "user", "content": user_input})
+        self._append_message({"role": "user", "content": user_input})
+        self.persist_state("running")
 
         for round_index in range(self.max_rounds):
             round_number = round_index + 1
@@ -233,12 +327,12 @@ class Agent:
 
             # no tool calls -> LLM is done, return text
             if not resp.tool_calls:
-                self.messages.append(resp.message)
+                self._append_message(resp.message)
                 return resp.content
 
             # tool calls -> execute. Multiple calls are scheduled by effect:
             # reads may overlap, while writes/unknown effects are barriers.
-            self.messages.append(resp.message)
+            self._append_message(resp.message)
 
             try:
                 if len(resp.tool_calls) == 1:
@@ -258,6 +352,7 @@ class Agent:
                     self._finish_tool_batch_progress(
                         [tc], on_tool_progress, parallel=False
                     )
+                    self._activate_skill_from_result(tc, result)
                     self._append_tool_result(tc.id, result)
                 else:
                     # effect-aware execution for multiple tool calls
@@ -265,10 +360,16 @@ class Agent:
                         resp.tool_calls, on_tool, on_tool_progress
                     )
                     for tc, result in zip(resp.tool_calls, results):
+                        self._activate_skill_from_result(tc, result)
                         self._append_tool_result(tc.id, result)
-            except KeyboardInterrupt:
-                # Ctrl+C mid-execution would leave the assistant tool_calls
-                # message without replies, poisoning the next request; backfill
+                # The assistant tool_calls and every corresponding observation
+                # are committed as one stable snapshot. Never persist halfway
+                # through a batch: resuming an orphan tool call is invalid.
+                self.persist_state("running")
+            except BaseException:
+                # An interrupt or an unexpected gate/callback failure during
+                # execution would otherwise leave assistant tool_calls without
+                # replies. Repair first so the failed autosave is resumable.
                 self._answer_pending_tool_calls(resp.tool_calls)
                 raise
 
@@ -297,6 +398,31 @@ class Agent:
         after = fixed_tokens + estimate_tokens(self.messages) + output_reserve + safety_margin
         if compressed:
             budget = self.context.last_budget
+            summary_messages = [
+                copy.deepcopy(message)
+                for message in self.messages
+                if str(message.get("content") or "").startswith((
+                    "[Context compressed - conversation summary]",
+                    "[Hard context reset]",
+                    "[Emergency context reset",
+                    "[Context reset]",
+                ))
+            ]
+            self._pending_context_summaries.append({
+                "summary_id": uuid.uuid4().hex,
+                "trigger": trigger,
+                "actions": list(self.context.last_actions),
+                "before_tokens": before,
+                "after_tokens": after,
+                "model": getattr(self.llm, "model", ""),
+                "prompt_tokens": (
+                    getattr(self.llm, "total_prompt_tokens", 0) - prompt_before
+                ),
+                "completion_tokens": (
+                    getattr(self.llm, "total_completion_tokens", 0) - completion_before
+                ),
+                "messages": summary_messages,
+            })
             self._trace(
                 "context.compressed",
                 trigger=trigger,
@@ -336,12 +462,154 @@ class Agent:
             return 0
 
     def _append_tool_result(self, tool_call_id: str, result: str):
-        self.messages.append({
+        self._append_message({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "content": result,
         })
         self._unconsumed_tool_call_ids.add(tool_call_id)
+
+    def _append_message(self, message: dict):
+        """Append to active context and preserve the original in Transcript."""
+        active = copy.deepcopy(message)
+        self.messages.append(active)
+        role = str(active.get("role") or "unknown")
+        if role == "assistant" and active.get("tool_calls"):
+            event_type = "assistant.tool_calls"
+        elif role == "tool":
+            event_type = "tool.result"
+        else:
+            event_type = f"{role}.message"
+        self._pending_transcript_events.append({
+            "event_id": uuid.uuid4().hex,
+            "event_type": event_type,
+            "run_id": self._active_run_id,
+            "round": self._active_round,
+            "payload": copy.deepcopy(active),
+        })
+
+    def state_snapshot(self, status: str = "saved") -> dict:
+        """Return a storage-neutral, JSON-serializable session snapshot."""
+        metadata = {
+            "agent_id": self.agent_id,
+            "plan_mode": self.plan_mode,
+            "unconsumed_tool_call_ids": sorted(self._unconsumed_tool_call_ids),
+            "usage_by_model": copy.deepcopy(
+                getattr(self.llm, "usage_by_model", {})
+            ),
+            "fallback_history": copy.deepcopy(
+                getattr(self.llm, "fallback_history", [])
+            ),
+            "active_skills": self.active_skill_states(),
+            "memory_state": self.memory.to_dict(),
+        }
+        if self._todo is not None:
+            metadata["todo_tasks"] = self._todo.snapshot()
+        return {
+            "model": getattr(self.llm, "model", ""),
+            "messages": copy.deepcopy(self.messages),
+            "status": status,
+            "workspace": str(self.workspace),
+            "prompt_tokens": max(
+                0, int(getattr(self.llm, "total_prompt_tokens", 0) or 0)
+            ),
+            "completion_tokens": max(
+                0, int(getattr(self.llm, "total_completion_tokens", 0) or 0)
+            ),
+            "estimated_cost": self._estimated_cost(),
+            "metadata": metadata,
+            "transcript_complete": True,
+            "transcript_events": copy.deepcopy(self._pending_transcript_events),
+            "context_summaries": copy.deepcopy(self._pending_context_summaries),
+        }
+
+    def restore_state(self, snapshot: dict, *, restore_model: bool = True):
+        """Restore one previously stable snapshot into this Agent instance."""
+        self.messages = copy.deepcopy(list(snapshot.get("messages") or []))
+        if restore_model and snapshot.get("model"):
+            self.llm.model = str(snapshot["model"])
+        self.llm.total_prompt_tokens = max(
+            0, int(snapshot.get("prompt_tokens") or 0)
+        )
+        self.llm.total_completion_tokens = max(
+            0, int(snapshot.get("completion_tokens") or 0)
+        )
+        metadata = dict(snapshot.get("metadata") or {})
+        if hasattr(self.llm, "usage_by_model"):
+            self.llm.usage_by_model = copy.deepcopy(metadata.get("usage_by_model") or {})
+        if hasattr(self.llm, "fallback_history"):
+            self.llm.fallback_history = copy.deepcopy(
+                metadata.get("fallback_history") or []
+            )
+        self.plan_mode = bool(metadata.get("plan_mode", False))
+        self.memory = MemoryState.from_dict(metadata.get("memory_state"))
+        for tool in self.tools:
+            if isinstance(tool, MemoryUpdateTool):
+                tool.bind(self.memory)
+        raw_skills = metadata.get("active_skills") or {}
+        self.active_skills = (
+            {
+                str(name): copy.deepcopy(record)
+                for name, record in raw_skills.items()
+                if isinstance(name, str) and isinstance(record, dict)
+            }
+            if isinstance(raw_skills, dict)
+            else {}
+        )
+        self._reconcile_active_skills()
+        self._unconsumed_tool_call_ids = set(
+            metadata.get("unconsumed_tool_call_ids") or []
+        )
+        if self._todo is not None:
+            tasks = metadata.get("todo_tasks")
+            if isinstance(tasks, list):
+                self._todo.restore(tasks)
+
+    def persist_state(self, status: str = "saved") -> bool:
+        """Best-effort persistence hook; storage failure never kills the run."""
+        if self._state_callback is None:
+            return False
+        snapshot = self.state_snapshot(status)
+        try:
+            self._state_callback(snapshot)
+            self.acknowledge_persisted(snapshot)
+            self._trace(
+                "session.state.saved",
+                status=status,
+                message_count=len(self.messages),
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("session state callback failed: %s", e)
+            self._trace(
+                "session.state.failed",
+                status=status,
+                error_type=type(e).__name__,
+            )
+            return False
+
+    def acknowledge_persisted(self, snapshot: dict):
+        """Forget only the pending records included in a successful save.
+
+        Event IDs make storage writes idempotent; filtering by ID also avoids
+        discarding records that may have arrived after the snapshot was built.
+        """
+        event_ids = {
+            event.get("event_id")
+            for event in snapshot.get("transcript_events") or []
+        }
+        summary_ids = {
+            item.get("summary_id")
+            for item in snapshot.get("context_summaries") or []
+        }
+        self._pending_transcript_events = [
+            event for event in self._pending_transcript_events
+            if event.get("event_id") not in event_ids
+        ]
+        self._pending_context_summaries = [
+            item for item in self._pending_context_summaries
+            if item.get("summary_id") not in summary_ids
+        ]
 
     def _trace(self, event: str, **fields):
         try:
@@ -373,11 +641,15 @@ class Agent:
             return None
 
     def _trace_tool_requested(self, tc):
+        tool = self._tool_by_name.get(tc.name)
         self._trace(
             "tool.requested",
             tool_call_id=tc.id,
             tool_name=tc.name,
             argument_keys=sorted(tc.arguments),
+            capabilities=(
+                sorted(tool.required_capabilities(tc.arguments)) if tool else []
+            ),
             **self._trace_content(arguments=tc.arguments),
         )
 
@@ -398,6 +670,9 @@ class Agent:
             "tool_name": tc.name,
             "arguments": tc.arguments,
             "effect": getattr(tool, "effect", "unknown"),
+            "capabilities": (
+                sorted(tool.required_capabilities(tc.arguments)) if tool else []
+            ),
         }
 
     def _has_parallel_work(self, tool_calls, gated_results) -> bool:
@@ -480,6 +755,26 @@ class Agent:
                 **self._trace_content(result=result),
             )
             return result
+        capability_started = time.perf_counter()
+        decision, result = self._capability_decision(tc)
+        self._trace(
+            "tool.capability_decided",
+            tool_call_id=tc.id,
+            tool_name=tc.name,
+            decision=decision,
+            allowed=result is None,
+            duration_ms=round((time.perf_counter() - capability_started) * 1000, 3),
+            **(self._trace_content(result=result) if result is not None else {}),
+        )
+        if result is not None:
+            self._trace(
+                "tool.blocked",
+                tool_call_id=tc.id,
+                tool_name=tc.name,
+                gate="capability",
+                **self._trace_content(result=result),
+            )
+            return result
         permission_started = time.perf_counter()
         decision, result = self._permission_decision(tc)
         content_fields = self._trace_content(result=result) if result is not None else {}
@@ -493,6 +788,12 @@ class Agent:
             **content_fields,
         )
         return result
+
+    def _capability_decision(self, tc) -> tuple[str, str | None]:
+        tool = self._tool_by_name.get(tc.name)
+        if tool is None:
+            return "unknown_tool", None
+        return self.capability_policy.decide(tool, tc.arguments)
 
     def _permission_decision(self, tc) -> tuple[str, str | None]:
         if self.plan_mode and tc.name not in Permission.READ_ONLY:
@@ -560,6 +861,8 @@ class Agent:
             outcome = "error" if lowered.startswith((
                 "error", "permission denied", "sandbox violation", "⚠ blocked",
             )) else "success"
+            if outcome == "success":
+                self._record_memory_effect(tc)
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
             self._trace(
                 "tool.completed",
@@ -603,6 +906,23 @@ class Agent:
             return finish(result)
         except Exception as e:  # noqa: BLE001
             return finish(f"Error executing {tc.name}: {e}")
+
+    def _record_memory_effect(self, tc):
+        """Derive modified files from successful built-in write calls."""
+        if tc.name not in {"write_file", "edit_file"}:
+            return
+        raw_path = tc.arguments.get("file_path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = self.workspace / path
+        resolved = path.resolve(strict=False)
+        try:
+            rendered = str(resolved.relative_to(self.workspace))
+        except ValueError:
+            rendered = str(resolved)
+        self.memory.record_file(rendered)
 
     def _exec_tools_parallel(
         self,
@@ -697,5 +1017,15 @@ class Agent:
 
     def reset(self):
         """Clear conversation history."""
+        self._pending_transcript_events.append({
+            "event_id": uuid.uuid4().hex,
+            "event_type": "session.reset",
+            "run_id": self._active_run_id,
+            "round": self._active_round,
+            "payload": {},
+        })
         self.messages.clear()
         self._unconsumed_tool_call_ids.clear()
+        self.active_skills.clear()
+        self.memory.clear()
+        self.persist_state("reset")

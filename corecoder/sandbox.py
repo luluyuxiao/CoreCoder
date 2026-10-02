@@ -8,6 +8,7 @@ unprivileged container with only the selected workspace mounted writable.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -136,6 +137,95 @@ class DockerCommandExecutor:
     def run(self, command: str, cwd: str, timeout: int) -> CommandResult:
         container_cwd = self._container_path(cwd)
         container_name = f"corecoder-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        argv = self._base_argv(
+            container_name,
+            workspace_access="rw",
+            workdir=str(container_cwd),
+        )
+        argv += ["--entrypoint", "/bin/sh", self.image, "-lc", command]
+
+        try:
+            proc = subprocess.run(
+                argv,
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # Killing the docker CLI does not guarantee that the container dies.
+            # Remove the precisely named container before surfacing the timeout.
+            self.remove_container(container_name)
+            raise
+        return CommandResult(proc.stdout, proc.stderr, proc.returncode)
+
+    def start_stdio_process(
+        self,
+        command: str,
+        args: list[str] | tuple[str, ...] = (),
+        *,
+        env: dict[str, str] | None = None,
+        workspace_access: str = "none",
+    ) -> tuple[subprocess.Popen, str]:
+        """Start one persistent stdio process in the same hardened boundary.
+
+        This is used by MCP servers. Unlike Bash, the executable is passed as a
+        direct Docker entrypoint rather than through a shell.
+        """
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("sandboxed process command must be non-empty")
+        container_name = f"corecoder-mcp-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        workdir = str(self.container_workspace) if workspace_access != "none" else "/tmp"
+        argv = self._base_argv(
+            container_name,
+            workspace_access=workspace_access,
+            workdir=workdir,
+            interactive=True,
+            env=env,
+        )
+        argv += ["--entrypoint", command, self.image, *list(args)]
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                env={**os.environ, **(env or {})},
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except BaseException:
+            self.remove_container(container_name)
+            raise
+        return proc, container_name
+
+    def remove_container(self, container_name: str):
+        """Best-effort removal of one precisely named container."""
+        try:
+            subprocess.run(
+                [self.docker_binary, "rm", "-f", container_name],
+                shell=False,
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        except OSError:
+            pass
+
+    def _base_argv(
+        self,
+        container_name: str,
+        *,
+        workspace_access: str,
+        workdir: str,
+        interactive: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> list[str]:
+        if workspace_access not in {"none", "ro", "rw"}:
+            raise ValueError("workspace_access must be 'none', 'ro', or 'rw'")
         argv = [
             self.docker_binary,
             "run",
@@ -166,45 +256,25 @@ class DockerCommandExecutor:
             "TMPDIR=/tmp",
             "--env",
             "PYTHONDONTWRITEBYTECODE=1",
-            "--mount",
-            # Bind mounts are read-write by default. Docker's --mount parser
-            # rejects a bare `rw` field (unlike the shorter --volume syntax).
-            f"type=bind,src={self.workspace_root},dst={self.container_workspace}",
             "--workdir",
-            str(container_cwd),
+            workdir,
         ]
+        if interactive:
+            argv.append("-i")
+        for key in sorted(env or {}):
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise ValueError(f"invalid environment variable name: {key!r}")
+            # Let Docker read the value from its own process environment so
+            # credentials do not appear in the host process command line.
+            argv += ["--env", key]
+        if workspace_access != "none":
+            mount = f"type=bind,src={self.workspace_root},dst={self.container_workspace}"
+            if workspace_access == "ro":
+                mount += ",readonly"
+            argv += ["--mount", mount]
         if hasattr(os, "getuid") and hasattr(os, "getgid"):
             argv += ["--user", f"{os.getuid()}:{os.getgid()}"]
-        argv += ["--entrypoint", "/bin/sh", self.image, "-lc", command]
-
-        try:
-            proc = subprocess.run(
-                argv,
-                shell=False,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            # Killing the docker CLI does not guarantee that the container dies.
-            # Remove the precisely named container before surfacing the timeout.
-            try:
-                subprocess.run(
-                    [self.docker_binary, "rm", "-f", container_name],
-                    shell=False,
-                    check=False,
-                    capture_output=True,
-                    timeout=10,
-                )
-            except OSError:
-                # Preserve the original timeout if the cleanup command itself
-                # cannot be started (for example, Docker disappeared).
-                pass
-            raise
-        return CommandResult(proc.stdout, proc.stderr, proc.returncode)
+        return argv
 
     def _container_path(self, cwd: str | Path) -> PurePosixPath:
         host_cwd = Path(cwd).expanduser().resolve()

@@ -168,7 +168,7 @@ def test_fetch_rejects_non_http():
 
 CoreCoder 是个起点，不是终点。下面这张清单写于较早的源码快照；当前源码已经补上 MCP tools 客户端和一个可选的 Docker bash 沙箱，所以这两项现在应当理解为「继续加固与扩展」，而不是「从零实现」：
 
-- **继续加固 bash 沙箱**。当前的 `--sandbox docker` 已有容器级隔离、默认断网、只读根文件系统和资源限制；下一步是自定义 seccomp/AppArmor、只读工作区、按任务镜像，以及把 hooks/MCP server 也纳入边界。
+- **继续加固执行沙箱**。当前的 `--sandbox docker` 已为 bash 提供容器级隔离，MCP Server 也能按 Server 选择相同的 Docker 边界；两者都默认断网、使用只读根文件系统并受资源限制。下一步是自定义 seccomp/AppArmor、按任务镜像、镜像供应链校验，以及把 hooks 也纳入边界。
 - **继续扩展模型路由和预算**。当前已经有显式 fallback 链和 fail-closed 的美元预算；生产部署还可以补 provider 独立凭据、熔断/健康检查、按任务选模型，以及账户侧真实账单配额。
 - **继续细化并发调度**。当前已经用 `Tool.effect` 把 `PURE/READ` 组成并发批次，并让 `WRITE/EXTERNAL/UNKNOWN` 充当串行屏障；下一步可以加入资源级 read/write set、按路径加锁、依赖 DAG，以及流式响应生成期间的投机执行。
 - **扩展 MCP**。当前 `mcp.py` 已经能通过 stdio 接入第三方 MCP tools；还可以继续补 resources、prompts、HTTP transport、认证和 server 生命周期管理。
