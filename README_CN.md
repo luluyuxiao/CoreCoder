@@ -2,7 +2,7 @@
 
 # CoreCoder
 
-**编程 agent 里的 nanoGPT。3.2k 行引擎、整包 8119 行纯 Python 全部一口气可读，读懂一个 coding agent 到底怎么运作，再 fork 出你自己的。**
+**编程 agent 里的 nanoGPT。3.9k 行引擎、整包 9650 行纯 Python 全部一口气可读，读懂一个 coding agent 到底怎么运作，再 fork 出你自己的。**
 
 *learn from it · fork it · ship something better*
 
@@ -12,7 +12,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Tests](https://github.com/he-yufeng/CoreCoder/actions/workflows/ci.yml/badge.svg)](https://github.com/he-yufeng/CoreCoder/actions)
-[![engine](https://img.shields.io/badge/engine-3202_LoC-blue)](article/)
+[![engine](https://img.shields.io/badge/engine-3918_LoC-blue)](article/)
 [![源码导读](https://img.shields.io/badge/源码导读-8篇双语-orange)](article/)
 
 </div>
@@ -25,7 +25,7 @@
 
 | | CoreCoder | Claude Code | aider | nanoGPT |
 |---|---|---|---|---|
-| 代码量 | 引擎约 3202 行 / 整包 8119 行 | 几十万行（闭源） | 数万行 Python | 约 600 行（两个文件） |
+| 代码量 | 引擎约 3918 行 / 整包 9650 行 | 几十万行（闭源） | 数万行 Python | 约 600 行（两个文件） |
 | 读完要多久 | 一个下午 | 读不了（闭源） | 得啃几天 | 一个下午 |
 | 能不能下断点改了再跑 | 能，每一行 | 不能 | 能，但量大 | 能 |
 | 定位 | 读懂并 fork 出你自己的 agent | 生产级编程助手 | 终端结对编程 | 教学用最小 GPT |
@@ -36,9 +36,9 @@ nanoGPT 那一列是拿来对照的：它最小、可读，但教的是训一个
 
 我一直觉得 coding agent 被讲得太玄了。把 Claude Code、Cursor 这类工具扒到底，核心是一个 while 循环套着一个大模型，外加七八个让它能真正动手的工具。难的从来不是这个循环，而是循环跑进真实世界以后要兜的那些底。CoreCoder 就是把这个核心老老实实写出来的最小版本。
 
-引擎部分（循环、模型接口、上下文、工具、会话）去掉空行和注释是 3202 行。把 Storage、Skills、Trace、Eval、最外层的 CLI、配置、打包一起算，整个包 36 个文件、物理 8119 行、净 7124 行，每个文件都短到能一口气读完。自 1161 行快照之后的增长都花在了看得见的功能上：plan mode、hooks、checkpoints、MCP、可随会话恢复的 Skill、bash/MCP Docker 隔离、Per-Tool Capability、带实时进度的副作用感知工具调度、模型 fallback、美元预算、按完整请求预算的上下文压缩、双层事务化 Session 存储、结构化任务 Memory、后台/worktree 子 agent，以及结构化 Trace/Eval，下文各有交代。
+引擎部分（循环、模型接口、上下文、工具、会话）去掉空行和注释是 3918 行。把 Storage、Skills、Trace、Eval、最外层的 CLI、配置、打包一起算，整个包 38 个文件、物理 9650 行、净 8520 行，每个文件都短到能一口气读完。自 1161 行快照之后的增长都花在了看得见的功能上：plan mode、hooks、可持久化 checkpoint/后台任务、stdio/HTTP MCP、可随会话恢复的 Skill、bash/MCP Docker 隔离、Per-Tool Capability、带实时进度的资源感知调度、跨 provider fallback route、美元预算、按完整请求预算的上下文压缩、双层事务化 Session 存储、结构化任务 Memory、后台/worktree 子 agent，以及结构化 Trace/Eval，下文各有交代。
 
-它真能跑：读写文件、执行 shell、按需加载项目工作流、把可压缩聊天历史和持久结构化任务 Memory 分开、派前台或后台子 agent、按需放进独立 Git worktree、分三层压上下文、自动保存可恢复会话，还能随时把这趟烧掉的 token 和美元数报给你。任何要动你磁盘、要跑命令的调用，都会先停下来等你点头，测试套件目前覆盖 278 个用例。但能跑不是为了劝你拿去日用，而是为了让这份「注释」不撒谎：一个解释 agent 怎么运作的范例，自己得真能运作。
+它真能跑：读写文件、执行 shell、按需加载项目工作流、把可压缩聊天历史和持久结构化任务 Memory 分开、派前台或后台子 agent、按需放进独立 Git worktree、分三层压上下文、自动保存可恢复会话，还能随时把这趟烧掉的 token 和美元数报给你。任何要动你磁盘、要跑命令的调用，都会先停下来等你点头，测试套件目前覆盖 297 个用例。但能跑不是为了劝你拿去日用，而是为了让这份「注释」不撒谎：一个解释 agent 怎么运作的范例，自己得真能运作。
 
 代码来自一次公开拆解。公开的源码分析里，Claude Code 这类生产级 agent 暴露出不少关键架构，我挑出最核心的一层，用尽量少的代码诚实地复写了一遍。所以读 CoreCoder，约等于读一份基于公开源码分析的「可运行注释版」：讲的是这类 agent 的核心思路，而它本身只是最小复写，就摆在你机器上，随你拆、随你改。
 
@@ -74,12 +74,14 @@ pip install -e .
 
 Kimi、Qwen 这些同样是改这两个变量；连 OpenAI 兼容接口都不给的 provider，装上可选的 LiteLLM 后端（`pip install "corecoder[litellm]"`）能路由一百多家。第三篇文章把这块讲得更细。key 可以直接 `export`，也可以在项目根目录扔个 `.env`，启动时自动加载。然后：
 
-需要故障降级和客户端花费上限时，可以配置有顺序的 fallback 链与美元预算。同一个 `LLM` 实例里的候选模型共用 backend、端点和显式凭据；凭据齐备时，LiteLLM 可以使用 `provider/model` 名称：
+需要故障降级和客户端花费上限时，可以配置有顺序的 fallback 链与美元预算。`CORECODER_FALLBACK_MODELS` 是同一主端点内切模型的短写法；`CORECODER_FALLBACK_ROUTES` 可以为每一跳独立选择 OpenAI-compatible/LiteLLM 后端、端点、凭据环境变量、模型和可选价格：
 
 ```bash
 export CORECODER_FALLBACK_MODELS=gpt-5.4-mini,gpt-4o-mini
+export QWEN_API_KEY=sk-...
+export CORECODER_FALLBACK_ROUTES='[{"name":"qwen","provider":"openai","model":"qwen3-plus","base_url":"https://dashscope.example/v1","api_key_env":"QWEN_API_KEY"}]'
 export CORECODER_MAX_COST_USD=1.00
-# 等价 CLI：--fallback-model gpt-5.4-mini --fallback-model gpt-4o-mini --max-cost 1.00
+# CLI 可重复传 --fallback-model 和 --fallback-route JSON。
 ```
 
 端到端真机冒烟过三家（读文件、改代码、跑一次确认、自己报告）：DeepSeek、Qwen3、Kimi K2，走同一个 OpenRouter 兼容端点，各自完整跑完全循环。写脚本用 one-shot 的留意：`-p` 默认拒绝一切改动类工具，要加 `--yes`，这是设计如此。
@@ -95,40 +97,42 @@ corecoder -p "给 parse_config() 加错误处理"   # 一次性模式，干完�
 
 ```
 corecoder/
-├── agent.py        主循环 + 调度 + 稳定状态快照        1031 行   ← 从这里开始读
-├── capabilities.py Per-Tool 权限能力策略              163 行
-├── llm.py          流式 + 重试 + fallback + 预算       567 行
+├── agent.py        主循环 + 调度 + 稳定状态快照        1220 行   ← 从这里开始读
+├── capabilities.py Per-Tool 权限能力策略              176 行
+├── decisions.py    统一结构化工具闸门决策               97 行
+├── resources.py    跨 Agent 资源读写锁                  97 行
+├── llm.py          流式 + 重试 + provider route        871 行
 ├── context.py      按完整请求预算的上下文压缩          431 行
 ├── session.py      存储兼容会话门面                   161 行
 ├── storage.py      Transcript + Active Context 存储    790 行
 ├── memory.py       Goal + 约束 + Plan + 决策            299 行
-├── permissions.py  改动类工具的用户授权               111 行
-├── hooks.py        工具调用前后的用户 shell 钩子        88 行
+├── permissions.py  改动类工具的用户授权               110 行
+├── hooks.py        工具调用前后的用户 shell 钩子        99 行
 ├── protect_paths_hook.py  可选敏感路径写保护           118 行
-├── mcp.py          host/Docker MCP stdio 客户端       350 行
+├── mcp.py          stdio/HTTP MCP + 恢复/准入         707 行
 ├── skills.py       项目/用户 Skill 发现与解析         160 行
 ├── sandbox.py      local/Docker 命令隔离边界           342 行
 ├── trace.py        默认隐私安全的内存/JSONL 事件        160 行
-├── eval.py         可重复用例、断言与指标               559 行
+├── eval.py         可重复用例、断言与指标               586 行
 ├── prompt.py       系统提示词                          41 行
-├── cli.py          REPL + 斜杠命令 + 一次性模式        961 行
-├── config.py       环境变量配置                        94 行
-├── checkpoints.py  /undo 快照与回滚                      44 行
+├── cli.py          REPL + 斜杠命令 + 一次性模式       1023 行
+├── config.py       环境变量配置                       109 行
+├── checkpoints.py  可持久化 Agent 级 /undo 栈          125 行
 ├── demo.py         离线端到端演示                       100 行
 └── tools/
     ├── bash.py       shell + 执行后端 + cd 追踪         179 行
-    ├── edit.py       唯一匹配搜索替换 + diff           107 行
+    ├── edit.py       唯一匹配搜索替换 + diff           126 行
     ├── grep.py       内容搜索                          114 行
     ├── glob_tool.py  文件名匹配                         67 行
-    ├── read.py       文件读取                           67 行
-    ├── write.py      文件写入                           54 行
+    ├── read.py       文件读取                           80 行
+    ├── write.py      文件写入                           73 行
     ├── todo.py       agent 自维护的任务清单             91 行
     ├── memory.py     结构化任务状态更新                  83 行
-    ├── agent.py      子 agent 模式 + 后台任务管理       447 行
+    ├── agent.py      可持久化子 agent/后台任务          645 行
     ├── fetch.py      有大小上限的 HTTP(S) 文本抓取       46 行
     ├── now.py        当前本地时间                        21 行
     ├── skill.py      Skill 加载与持久化激活状态          119 行
-    └── base.py       工具基类 + 副作用元数据             64 行
+    └── base.py       工具基类 + 资源元数据               88 行
 .corecoder/skills/
 └── corecoder-review/SKILL.md  针对本仓库的审查工作流
 examples/
@@ -136,7 +140,7 @@ examples/
 └── eval_cases.json     Eval 清单起步示例
 ```
 
-十二个内建工具：`bash`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`todo_write`、`memory_update`、`agent`、`agent_status`、`fetch_url` 和 `now`。发现 Skill 时还会加入一个只读的 `load_skill` 适配器；它只增加工作方法，不增加执行权限。存在 `~/.corecoder/mcp.json` 时，里面的 MCP 服务器会再以 `mcp__*` 工具的身份并进来。
+十三个内建工具：`bash`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`todo_write`、`memory_update`、`agent`、`agent_status`、`agent_resume`、`fetch_url` 和 `now`。发现 Skill 时还会加入一个只读的 `load_skill` 适配器；它只增加工作方法，不增加执行权限。存在 `~/.corecoder/mcp.json` 时，里面的 MCP 服务器会再以 `mcp__*` 工具的身份并进来。
 
 ## 一个 while 循环就是 agent 的本体
 
@@ -151,7 +155,7 @@ def chat(self, user_input):
         reply = self.llm.chat(self.messages, self.tools)   # 交给模型规划下一步
         if not reply.tool_calls:                       # 模型不再要工具
             return reply.text                          #   → 收工，把回答给用户
-        results = schedule_by_effect(reply.tool_calls) # 只读并发，副作用调用串行
+        results = schedule_by_resource(reply.tool_calls) # 资源不冲突才并发
         self.messages += results                       # 结果回灌，进入下一轮
 
     return "(已达轮次上限)"
@@ -165,7 +169,7 @@ def chat(self, user_input):
 
 **上下文不是满了才一刀切，而是先按完整请求算预算，再分层退让。** CoreCoder 会先扣除动态 system prompt、Tool Schema、输出 token 预留和估算安全余量，再对剩余消息预算使用 50/70/90% 阈值：先机械截短陈旧工具输出，再总结旧对话，最后才硬折叠。最新 Tool Result 在被一次成功的 LLM 请求消费前不会参与普通截短；最终还有确定性的强制适配步骤，保证估算后的完整请求低于窗口上限，只有最新一批结果自身都放不下时才会有标记地压缩它。
 
-**约束子 agent 能干什么，靠的是不给它那些能力，而不是写一堆规则求它听话。** 派出去的子 agent 有隔离的上下文和一套新的内建工具实例，但拿不到 `agent` 与 `agent_status`，所以不能递归派后代。它复用父 agent 的模型连接与花费账本，结果超过 5000 字会截短，轮次上限是 20。`run_mode` 选择阻塞的前台执行或进程内后台执行；`isolation` 再独立选择当前 checkout 或从 `HEAD` 创建并保留的 Git worktree/分支。
+**约束子 agent 能干什么，靠的是不给它那些能力，而不是写一堆规则求它听话。** 派出去的子 agent 有隔离的上下文和一套新的内建工具实例，但拿不到 `agent`、`agent_status` 与 `agent_resume`，所以不能递归派后代。它复用父 agent 的模型连接、花费账本与资源锁，结果超过 5000 字会截短，轮次上限是 20。`run_mode` 选择阻塞的前台执行或进程内后台执行；`isolation` 再独立选择当前 checkout 或从 `HEAD` 创建并保留的 Git worktree/分支。后台任务记录和文件 checkpoint 会进入 Session 快照；恢复时原本 `queued/running` 的任务会成为 `interrupted`，必须显式且通过 Permission 的 `agent_resume` 才会重启，避免悄悄重复副作用。
 
 每一个「为什么」，下面的文章系列都拆到了具体代码行。
 
@@ -178,7 +182,7 @@ def chat(self, user_input):
 - **[02 工具系统：让模型安全地动手](article/02-tools.md)** — `tools/` 内建工具、副作用元数据与 bash 安全闸
 - **[03 接入任意大模型，顺便把账算清楚](article/03-llm-and-cost.md)** — `llm.py` 的 provider 包装、重试与成本统计
 - **[04 用有限的窗口扛住一个长任务](article/04-context.md)** — `context.py` 的三层压缩与孤儿 tool 消息
-- **[05 并行执行与子 agent](article/05-parallel-and-subagents.md)** — 副作用感知的只读并发与子 agent 隔离
+- **[05 并行执行与子 agent](article/05-parallel-and-subagents.md)** — 资源感知并发与子 agent 隔离
 - **[06 把它跑成一个真正的命令行工具](article/06-session-and-cli.md)** — CLI、事务化会话存储与崩溃恢复
 - **[07 Fork CoreCoder，搭一个你自己的 coding agent](article/07-build-your-own.md)** — 从 fork 到加自定义工具到换模型
 - **[08 不动主循环的三种加法：MCP、钩子与计划模式](article/08-extensibility.md)** — v0.6.0 扩展三件套，以及让它们成立的那条契约
@@ -187,8 +191,8 @@ def chat(self, user_input):
 
 读懂之后，最自然的下一步就是 fork。起手不用伤筋动骨：
 
-- **换个你常用的模型。** 就是上面那两个环境变量，`llm.py`（498 行）是 provider 适配、fallback 和花费控制的入口。
-- **加一件你自己的工具。** 照 `tools/base.py`（47 行）的工具契约写个新文件、声明副作用类型，跑测试、抓网页、调 LSP 都行，第二篇文章末尾手把手带你写第一个。
+- **换个你常用的模型。** 就是上面那两个环境变量，`llm.py` 是 provider 适配、跨 provider fallback 和花费控制的入口。
+- **加一件你自己的工具。** 照 `tools/base.py` 的工具契约写个新文件，声明副作用、Capability 和具体资源读写声明，跑测试、抓网页、调 LSP 都行，第二篇文章末尾手把手带你写第一个。
 - **改系统提示词。** `prompt.py` 才 41 行，改一句就能看到 agent 的脾气变了，是门槛最低的「改一处就有反馈」。
 - **直接当库 import。** 顶层导出了 `Agent`、`LLM`、`Config`，能嵌进你自己的程序：
 
@@ -202,10 +206,10 @@ print(Agent(llm=llm).chat("找出项目里所有 TODO 注释并列出来"))
 往深里做，方向也都摆在明处。Docker 沙箱现在已有一个可工作的最小基线；下面这些仍是你能接着往下做、把它推向生产级的入口：
 
 - **继续加固沙箱。** `--sandbox docker` 已经给 `bash` 提供真正的容器边界，单个 MCP Server 也可以选择进入同一套加固后的 Docker 运行时；生产部署还可以补自定义 seccomp/AppArmor、按任务制作镜像、镜像签名/扫描，以及把 hooks 也隔离起来。
-- **模型降级策略保持显式。** 瞬时故障先耗尽指数退避，再沿配置的 fallback 链切换；成功后保持在备用模型。可选美元上限会在发送前预留下一次输入、压低最大输出，对未知价格或缺失 usage 直接拒绝。生产 fork 还可以继续做健康度路由、provider 独立凭据和账户侧账单告警。
-- **子 agent 模式已经显式化，但仍是进程内实现。** 当前已有前台/后台和共享目录/worktree 两组正交模式；生产 fork 还可以补持久化 worker、取消、事件流、自动 merge/cherry-pick 策略和跨进程/跨主机隔离。
+- **模型降级策略保持显式。** 瞬时故障先耗尽指数退避，再沿独立配置的 provider route 切换；成功后保持在备用路由。可选美元上限按 route 计价，在发送前预留下一次输入、压低最大输出，对未知价格或缺失 usage 直接拒绝。生产 fork 还可以继续做健康度加权路由和账户侧账单告警。
+- **子 agent 模式已经显式化，但仍是进程内实现。** 当前已有前台/后台和共享目录/worktree 两组正交模式，任务记录可随 Session 恢复，但 Python 线程不会跨进程存活；未完成任务恢复为 `interrupted`，等待显式 `agent_resume`。生产 fork 还可以补持久化 worker、取消、事件流、自动 merge/cherry-pick 策略和跨进程/跨主机隔离。
 - **Trace 和 Eval 是本地、刻意保持小型的积木。** JSONL 能精确复盘一次运行，Eval runner 把确定性用例变成成功率、延迟、token、工具和成本指标。生产 fork 还可以接 OpenTelemetry、Trace UI、语义/模型裁判、数据集管理和 CI 趋势存储。
-- **不做 RAG，MCP 客户端也只讲工具这一小片。** 给大仓加检索式代码定位还空着，`mcp.py` 也特意没实现 resources 和 prompts。随便挑一个，都是从最小核心往你自己的更强 agent 扩的真实方向。
+- **不做 RAG，MCP 客户端也只讲工具这一小片。** 当前已支持 stdio/Streamable HTTP Tool、重连、熔断、刷新和启动前准入，但仍特意没实现 MCP resources/prompts；大仓检索与这两块协议面都是继续扩展的真实方向。
 
 README 只给方向，每条的代码细节第七篇接着讲。挑一个动手，就是把它做得更好的开始。
 
@@ -232,6 +236,7 @@ README 只给方向，每条的代码细节第七篇接着讲。挑一个动手�
 /transcript      查看不受上下文压缩影响的完整原始历史
 /delete-session  按 ID 删除非当前会话
 /agents          列出后台子 agent
+/mcp-refresh     必要时重连并刷新 MCP Tool Schema
 quit / exit      退出（Ctrl+C 取消当前回合）
 ```
 
@@ -239,7 +244,7 @@ quit / exit      退出（Ctrl+C 取消当前回合）
 
 SQLite WAL 支持并发读写。Agent 只在 provider 可接受的稳定边界发快照：用户消息落入后、完整 Tool Result 批次回填后，以及完成、失败或中断时。因此恢复出来的 Active Context 不会出现只有 assistant `tool_calls`、缺少 observation 的半截结构。压缩记录还会进入 `summaries` 表，包含动作、前后 token、生成模型和摘要消息。`--no-autosave` 可关闭自动写入但保留 `/save`；`--storage PATH` 或 `CORECODER_STORAGE_PATH` 可换数据库位置。旧 v1/v2/JSON Session 会在读取时迁移；因为过去被压掉的原文无法重建，迁移记录会明确标为 Transcript 不完整。
 
-持久化内容包括完整 Transcript、压缩后的 Active Context、摘要记录、结构化任务 Memory、模型、workspace、状态、token/cost、fallback usage、plan mode、todo、已激活 Skill 记录和尚未消费的 Tool Result ID；API Key 与 permission 授权刻意不落盘。Session ID 仍会先规整成安全的数据库 key/旧版文件名，SQLite 与 JSON 文件在系统允许时只授予当前用户访问权限。
+持久化内容包括完整 Transcript、压缩后的 Active Context、摘要记录、结构化任务 Memory、模型、workspace、状态、按模型/Provider Route 统计的 token/cost、plan mode、todo、已激活 Skill、文件 checkpoint、后台任务记录和尚未消费的 Tool Result ID；API Key 与 permission 授权刻意不落盘。Session ID 仍会先规整成安全的数据库 key/旧版文件名，SQLite 与 JSON 文件在系统允许时只授予当前用户访问权限。
 
 数据库在本机，但没有加密。messages 和 Tool Result 自身可能包含源码、prompt、命令输出，甚至工具从 workspace 读到的秘密；敏感任务请加 `--no-autosave`，或者用 `--storage` 指向妥善保护的位置。
 
@@ -259,13 +264,13 @@ Skill 是可复用的工作流指令，刻意与可执行 Tool 分开。CoreCode
 
 ## 工具执行进度
 
-工具执行现在有独立的实时视图，不再只是把已发起的调用名逐行打印出来。模型一次返回多个调用时，只有副作用调度器确认其中存在真正并发的只读批次，标题才显示 `Parallel tools`；否则显示 `Tool batch`。每项调用会按 `queued` → `running` → `done`、`error` 或 `blocked` 更新，带耗时和总体 `n/N` 计数。所有 permission 提问都先在主线程处理完，之后才启动进度 UI，因此交互授权不会和 Rich 的实时刷新抢终端。
+工具执行现在有独立的实时视图，不再只是把已发起的调用名逐行打印出来。模型一次返回多个调用时，只有资源感知调度器确认存在真正并发批次，标题才显示 `Parallel tools`；否则显示 `Tool batch`。Pure/Read 调用仍可重叠；显式 opt-in 的有状态 Tool 会返回读/写 `ResourceClaim`：不同文件写入、不同 MCP Server 可并行，同一文件/Server 必须串行；共享的 `ResourceLockManager` 还会协调父子 Agent。每项调用会按 `queued` → `running` → `done`、`error` 或 `blocked` 更新，带耗时和总体 `n/N` 计数。所有 permission 提问都先在主线程处理完，之后才启动进度 UI，因此交互授权不会和 Rich 的实时刷新抢终端。
 
 把 CoreCoder 当库嵌入时，也可以向 `Agent.chat()` 传 `on_tool_progress`，用同一组结构化事件驱动自己的界面：`batch_started`、`tool_started`、`tool_completed`、`batch_completed`。原有的 `on_tool(name, arguments)` 仍保持兼容；进度回调只属于展示层，即使它自己报错，工具和 Agent Loop 也会继续执行。
 
 ## 权限
 
-只读和进程内状态工具（`read_file`、`glob`、`grep`、`todo_write`、`memory_update`、`now`、`agent_status`、`load_skill`）模型一调就跑。会修改磁盘或访问外部资源的那些（`edit_file`、`write_file`、`bash`、`fetch_url`、MCP 工具以及派生子 agent）先停下来等你点头，REPL 启动横幅里能看到当前是哪种模式：
+只读和进程内状态工具（`read_file`、`glob`、`grep`、`todo_write`、`memory_update`、`now`、`agent_status`、`load_skill`）模型一调就跑。会修改磁盘或访问外部资源的那些（`edit_file`、`write_file`、`bash`、`fetch_url`、MCP 工具、派生子 agent 与 `agent_resume`）先停下来等你点头，REPL 启动横幅里能看到当前是哪种模式。Hook、Capability、Plan Mode 和 Permission 现在统一返回结构化 `ToolDecision`，Trace 不再需要猜测混杂的字符串/tuple：
 
 - REPL 里每次调用问一次：允许这一次、本工具本次会话都允许、或者拒绝。前台子 agent 继承这层交互授权；后台线程绝不会与 REPL 抢输入，只能使用 `--yes` 或已被标记为「总是允许」的工具，其余有状态调用 fail closed，让子 agent 自己绕开。
 - 一次性模式（`-p`）没人可问，改动类调用当场被拒，拒绝理由作为普通工具结果回给模型：循环绝不会卡在等一个永远不会来的输入上。要全部预授权就加 `--yes`（脚本、CI 场景）。
@@ -287,7 +292,7 @@ Skill 是可复用的工作流指令，刻意与可执行 Tool 分开。CoreCode
 }
 ```
 
-可以使用 `--capability-policy PATH` 或 `CORECODER_CAPABILITY_POLICY`；`/capabilities` 会显示当前策略和所有 Tool 的能力声明。没有策略文件时保持向后兼容的全部允许。`default: deny` 下，不需要外部能力的 `now`、`agent_status`、内存 todo 和结构化 Memory 仍可运行，未知自定义 Tool 则 fail closed。更完整的起点见 [examples/capabilities.json](examples/capabilities.json)。
+可以使用 `--capability-policy PATH` 或 `CORECODER_CAPABILITY_POLICY`；`/capabilities` 会显示当前策略和所有 Tool 的能力声明。没有策略文件时保持向后兼容的全部允许。`default: deny` 下，不需要外部能力的 `now`、`agent_status`、内存 todo 和结构化 Memory 仍可运行，未知自定义 Tool 则 fail closed。MCP 会在启动进程或首次 HTTP 请求前先检查服务器通配名（例如 `mcp__weather__*`），拒绝的服务器根本不会启动，发现后的每次 Tool Call 还会再过一次策略。更完整的起点见 [examples/capabilities.json](examples/capabilities.json)。
 
 ```bash
 corecoder --capability-policy examples/capabilities.json --sandbox docker
@@ -362,17 +367,20 @@ Docker Sandbox。
 
 ## MCP 服务器
 
-在 `~/.corecoder` 下放一个 `mcp.json`，任何 MCP 服务器的工具就能通过 stdio 接进 agent，配置形状和 Claude Code 的一样：
+在 `~/.corecoder` 下放一个 `mcp.json`，任何 MCP 服务器的工具就能通过 stdio 或 Streamable HTTP 接进 agent：
 
 ```json
 {
   "mcpServers": {
-    "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}
+    "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]},
+    "weather": {"url": "https://mcp.example.test", "headers": {"Authorization": "Bearer ..."}}
   }
 }
 ```
 
-每个配好的服务器在启动时拉起一个子进程，握手、列出工具；每件工具都注册成 `mcp__<服务器>__<工具>`，Hook、Capability Policy 和 Permission 对它与内建工具一视同仁。MCP 工具不在只读名单里。握手给十五秒，一次调用给六十秒；服务器挂了或者迟迟不应，那一次调用就以普通 Tool Result 报错，循环照常往下走。客户端只实现工具协议片段（`initialize`、`tools/list`、`tools/call`）。没有 `mcp.json` 就没有 MCP，一切照旧。
+每个通过启动准入的服务器会握手、列出工具；每件工具都注册成 `mcp__<服务器>__<工具>`，Hook、Capability Policy、Permission、资源调度与 Trace 对它和内建工具一视同仁。MCP 工具不在只读名单里。握手给十五秒，一次调用给六十秒。stdio 进程死亡后，下一次调用前会自动重连和重新握手；失败的那次 `tools/call` 本身绝不自动重放，因为远端副作用是否已经发生并不确定。连续传输失败会打开可配置熔断器（默认三次、三十秒）。`/mcp-refresh` 会按需重连、重新执行 `tools/list`，并原子替换 Agent Tool Registry 与 System Prompt 中的 Schema；刷新失败时保留旧 Tool 包装器。HTTP 会保存 `Mcp-Session-Id`，接受 JSON/SSE 响应，关闭时发送 `DELETE`。客户端仍只实现工具协议面（`initialize`、`ping`、`tools/list`、`tools/call`），没有实现 resources/prompts。没有 `mcp.json` 就没有 MCP，一切照旧。
+
+`reconnect`、`circuit_failures`、`circuit_cooldown` 可以写在 `defaults` 或某个 Server 下。stdio Server 可配置 `sandbox`；远端 HTTP 不能塞进本地进程容器，其能力声明只有 `mcp` + `network`。同一个 Server 的调用因为共享会话/状态而串行，不同 Server 可以并行。
 
 为了兼容已有配置，默认仍是宿主机进程；也可以让 Server 常驻在一个加固的 Docker stdio 容器中：
 
@@ -453,7 +461,7 @@ corecoder-eval examples/eval_cases.json --repeat 3 \
 
 ## 贡献 / License
 
-动手之前先跑一遍 `pytest tests/ -q`（278 个用例）、`ruff check` 和 `compileall`，绿了再提。MIT License，欢迎 fork 拿去造更好的东西，能在 README 里留一句出处就更好。
+动手之前先跑一遍 `pytest tests/ -q`（297 个用例）、`ruff check` 和 `compileall`，绿了再提。MIT License，欢迎 fork 拿去造更好的东西，能在 README 里留一句出处就更好。
 
 ---
 

@@ -1,5 +1,6 @@
 """Configuration - env vars and defaults."""
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,10 +31,23 @@ def _load_dotenv():
     load_dotenv(env_path, override=False)
 
 
+def _route_specs(raw: str) -> list[dict]:
+    if not raw.strip():
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"CORECODER_FALLBACK_ROUTES is not valid JSON: {error}") from error
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError("CORECODER_FALLBACK_ROUTES must be a JSON array of objects")
+    return value
+
+
 @dataclass
 class Config:
     model: str = "gpt-5.5"
     fallback_models: list[str] = field(default_factory=list)
+    fallback_routes: list[dict] = field(default_factory=list)
     api_key: str = ""
     base_url: str | None = None
     max_cost_usd: float | None = None
@@ -73,6 +87,7 @@ class Config:
         return cls(
             model=os.getenv("CORECODER_MODEL", "gpt-5.5"),
             fallback_models=fallback_models,
+            fallback_routes=_route_specs(os.getenv("CORECODER_FALLBACK_ROUTES", "")),
             api_key=api_key,
             base_url=os.getenv("OPENAI_BASE_URL") or os.getenv("CORECODER_BASE_URL"),
             max_cost_usd=float(max_cost) if max_cost else None,

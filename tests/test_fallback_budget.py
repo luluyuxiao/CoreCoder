@@ -1,5 +1,8 @@
 """Fallback routing and fail-closed USD budget enforcement."""
 
+import json
+import sys
+import types
 from types import SimpleNamespace
 from unittest import mock
 
@@ -7,7 +10,13 @@ import pytest
 from openai import APIConnectionError, AuthenticationError
 
 from corecoder.config import Config
-from corecoder.llm import LLM, BudgetExceededError, LiteLLM, _request_token_upper_bound
+from corecoder.llm import (
+    LLM,
+    BudgetExceededError,
+    LiteLLM,
+    ProviderRoute,
+    _request_token_upper_bound,
+)
 
 
 def _request():
@@ -230,3 +239,123 @@ def test_cli_accepts_ordered_fallbacks_and_positive_budget(monkeypatch):
 
     assert args.fallback_models == ["gpt-4o-mini", "deepseek-chat"]
     assert args.max_cost_usd == 0.5
+
+
+def test_fallback_route_switches_base_url_credentials_and_is_sticky():
+    with mock.patch("corecoder.llm.OpenAI") as factory:
+        primary_client = mock.Mock(name="primary-client")
+        fallback_client = mock.Mock(name="fallback-client")
+        factory.side_effect = [primary_client, fallback_client]
+        llm = LLM(
+            model="primary-model",
+            api_key="primary-key",
+            base_url="https://primary.example/v1",
+            fallback_routes=[ProviderRoute(
+                name="deepseek",
+                provider="openai",
+                model="deepseek-chat",
+                api_key="fallback-key",
+                base_url="https://api.deepseek.example/v1",
+            )],
+        )
+
+        calls = []
+
+        def dispatch(params):
+            calls.append((llm.client, params["model"]))
+            if params["model"] == "primary-model":
+                raise APIConnectionError(request=_request())
+            return _stream("fallback")
+
+        llm._call_with_retry = mock.Mock(side_effect=dispatch)
+
+        assert llm.chat([{"role": "user", "content": "hi"}]).content == "fallback"
+        assert llm.active_route.route_id == "deepseek"
+        assert llm.model == "deepseek-chat"
+        assert calls == [
+            (primary_client, "primary-model"),
+            (fallback_client, "deepseek-chat"),
+        ]
+        assert factory.call_args_list == [
+            mock.call(api_key="primary-key", base_url="https://primary.example/v1"),
+            mock.call(api_key="fallback-key", base_url="https://api.deepseek.example/v1"),
+        ]
+
+
+def test_openai_primary_can_fallback_to_litellm_route(monkeypatch):
+    fake = types.ModuleType("litellm")
+    fake.completion = mock.Mock(return_value=_stream("from litellm", prompt=20, completion=4))
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+    llm = LLM(
+        model="gpt-4o",
+        api_key="primary",
+        fallback_routes=[{
+            "name": "claude",
+            "provider": "litellm",
+            "model": "anthropic/claude-haiku-4-5",
+            "api_key": "anthropic-key",
+            "base_url": "https://litellm.example",
+        }],
+    )
+    llm._call_with_retry = mock.Mock(side_effect=APIConnectionError(request=_request()))
+
+    response = llm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.content == "from litellm"
+    assert llm.active_route.provider == "litellm"
+    kwargs = fake.completion.call_args.kwargs
+    assert kwargs["model"] == "anthropic/claude-haiku-4-5"
+    assert kwargs["api_key"] == "anthropic-key"
+    assert kwargs["api_base"] == "https://litellm.example"
+
+
+def test_route_specific_price_is_used_and_secret_is_not_public():
+    route = ProviderRoute(
+        name="private",
+        model="private-model",
+        api_key="never-persist-me",
+        input_price=2.0,
+        output_price=6.0,
+    )
+    llm = LLM(model="primary", api_key="primary", fallback_routes=[route])
+    llm._activate_route(route)
+    llm._call_with_retry = mock.Mock(return_value=_stream(prompt=1_000, completion=500))
+
+    llm.chat([{"role": "user", "content": "usage"}])
+
+    assert llm.estimated_cost == pytest.approx((2_000 + 3_000) / 1_000_000)
+    assert "api_key" not in route.public_dict()
+
+
+def test_same_model_endpoint_can_fallback_to_a_secondary_credential():
+    llm = LLM(
+        model="gpt-4o",
+        api_key="primary-key",
+        base_url="https://gateway.example/v1",
+        fallback_routes=[{
+            "name": "secondary-account",
+            "model": "gpt-4o",
+            "base_url": "https://gateway.example/v1",
+            "api_key": "secondary-key",
+        }],
+    )
+
+    assert [route.route_id for route in llm.routes] == ["primary", "secondary-account"]
+    assert llm.fallback_routes[0].api_key == "secondary-key"
+
+
+def test_config_reads_cross_provider_routes_from_json(monkeypatch):
+    monkeypatch.setenv("FALLBACK_SECRET", "secret")
+    monkeypatch.setenv("CORECODER_FALLBACK_ROUTES", json.dumps([{
+        "name": "qwen",
+        "provider": "openai",
+        "model": "qwen3-plus",
+        "base_url": "https://dashscope.example/v1",
+        "api_key_env": "FALLBACK_SECRET",
+    }]))
+
+    config = Config.from_env()
+    llm = LLM(model="gpt-4o", api_key="primary", fallback_routes=config.fallback_routes)
+
+    assert config.fallback_routes[0]["model"] == "qwen3-plus"
+    assert llm.fallback_routes[0].api_key == "secret"

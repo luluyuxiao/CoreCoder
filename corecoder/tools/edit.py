@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import ClassVar
 
 from ..capabilities import FILESYSTEM_READ, FILESYSTEM_WRITE
-from ..checkpoints import record as _record_checkpoint
+from ..checkpoints import DEFAULT_MANAGER, CheckpointManager
+from ..resources import ResourceClaim
 from ..sandbox import WorkspacePathPolicy
 from .base import Tool, ToolEffect
 
@@ -22,6 +23,7 @@ _changed_files: set[str] = set()
 class EditFileTool(Tool):
     name = "edit_file"
     effect = ToolEffect.WRITE
+    resource_parallel = True
     capabilities = frozenset({FILESYSTEM_READ, FILESYSTEM_WRITE})
     description = (
         "Edit a file by replacing an exact string match. "
@@ -47,16 +49,33 @@ class EditFileTool(Tool):
         "required": ["file_path", "old_string", "new_string"],
     }
 
-    def __init__(self, path_policy: WorkspacePathPolicy | None = None):
+    def __init__(
+        self,
+        path_policy: WorkspacePathPolicy | None = None,
+        checkpoint_manager: CheckpointManager | None = None,
+    ):
         self.path_policy = path_policy
+        self.checkpoints = checkpoint_manager or DEFAULT_MANAGER
+
+    def _path(self, file_path: str) -> Path:
+        return (
+            self.path_policy.resolve(file_path)
+            if self.path_policy else Path(file_path).expanduser().resolve()
+        )
+
+    def resource_claims(self, arguments: dict) -> tuple[ResourceClaim, ...]:
+        raw = arguments.get("file_path")
+        if not isinstance(raw, str) or not raw:
+            return super().resource_claims(arguments)
+        try:
+            path = self._path(raw)
+        except (OSError, ValueError):
+            return super().resource_claims(arguments)
+        return (ResourceClaim(f"file:{path}", "write"),)
 
     def execute(self, file_path: str, old_string: str, new_string: str) -> str:
         try:
-            p = (
-                self.path_policy.resolve(file_path)
-                if self.path_policy
-                else Path(file_path).expanduser().resolve()
-            )
+            p = self._path(file_path)
             if not p.exists():
                 return f"Error: {file_path} not found"
 
@@ -79,7 +98,7 @@ class EditFileTool(Tool):
                 )
 
             new_content = content.replace(old_string, new_string, 1)
-            _record_checkpoint(p)
+            self.checkpoints.record(p)
             p.write_text(new_content, encoding="utf-8")
             _changed_files.add(str(p))
 

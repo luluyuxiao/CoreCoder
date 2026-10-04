@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 from corecoder import checkpoints
+from corecoder.agent import Agent
+from corecoder.checkpoints import CheckpointManager
+from corecoder.demo import ScriptedLLM
 from corecoder.tools.edit import EditFileTool
 from corecoder.tools.write import WriteFileTool
 
@@ -69,3 +74,24 @@ def test_undo_recreates_a_deleted_parent_tree(tmp_path):
     msg = checkpoints.undo()
     assert msg == f"Restored {f} (recreated missing parent directories)."
     assert f.read_text() == "v1\n"
+
+
+def test_agent_scoped_checkpoint_survives_session_snapshot_restore(tmp_path):
+    target = tmp_path / "durable.txt"
+    original_manager = CheckpointManager()
+    original_tool = WriteFileTool(checkpoint_manager=original_manager)
+    original = Agent(llm=ScriptedLLM([]), tools=[original_tool], workspace=tmp_path)
+    original_tool.execute(str(target), "created\n")
+    snapshot = json.loads(json.dumps(original.state_snapshot()))
+
+    restored_manager = CheckpointManager()
+    restored = Agent(
+        llm=ScriptedLLM([]),
+        tools=[WriteFileTool(checkpoint_manager=restored_manager)],
+        workspace=tmp_path,
+    )
+    restored.restore_state(snapshot)
+
+    assert restored.checkpoints.pending() == 1
+    assert restored.checkpoints.undo() == f"Removed {target} (created this session)."
+    assert not target.exists()

@@ -6,7 +6,7 @@ from corecoder.agent import Agent
 from corecoder.capabilities import CapabilityPolicy
 from corecoder.config import Config
 from corecoder.context import ContextOverflowError
-from corecoder.llm import LLM, BudgetExceededError
+from corecoder.llm import LLM, BudgetExceededError, ProviderRoute
 from corecoder.memory import MemoryState
 from corecoder.skills import Skill, SkillRegistry
 from corecoder.storage import JsonSessionStore, SessionRecord, SessionStore, SQLiteSessionStore
@@ -26,6 +26,7 @@ __all__ = [
     "JsonlTrace",
     "MemoryState",
     "MemoryTrace",
+    "ProviderRoute",
     "SQLiteSessionStore",
     "SessionRecord",
     "SessionStore",

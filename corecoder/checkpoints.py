@@ -1,44 +1,125 @@
-"""Session-scoped undo for file mutations.
+"""Agent-scoped, serializable undo checkpoints for file mutations."""
 
-edit_file and write_file record a checkpoint before touching a file; /undo
-pops the latest one and restores the previous bytes (or removes the file if
-it did not exist). In-memory only: undo history dies with the process, and
-bash side effects are not tracked, only the two file-writing tools.
-"""
+from __future__ import annotations
 
+import base64
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 
-# (path, prior bytes or None if the file did not exist)
-_stack: list[tuple[str, bytes | None]] = []
+
+@dataclass(frozen=True)
+class Checkpoint:
+    path: str
+    prior: bytes | None
+
+    def as_dict(self) -> dict:
+        return {
+            "path": self.path,
+            "existed": self.prior is not None,
+            "prior_base64": (
+                base64.b64encode(self.prior).decode("ascii")
+                if self.prior is not None else ""
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Checkpoint | None:
+        try:
+            path = str(data["path"])
+            existed = bool(data.get("existed"))
+            prior = (
+                base64.b64decode(str(data.get("prior_base64") or ""), validate=True)
+                if existed else None
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        return cls(path=path, prior=prior)
+
+
+class CheckpointManager:
+    """Thread-safe undo stack that can be saved inside a session snapshot."""
+
+    def __init__(self, checkpoints: list[dict] | None = None):
+        self._lock = threading.RLock()
+        self._stack: list[Checkpoint] = []
+        if checkpoints:
+            self.restore(checkpoints)
+
+    def record(self, path: Path) -> None:
+        resolved = path.expanduser().resolve(strict=False)
+        checkpoint = Checkpoint(
+            path=str(resolved),
+            prior=resolved.read_bytes() if resolved.exists() else None,
+        )
+        with self._lock:
+            self._stack.append(checkpoint)
+
+    def undo(self) -> str:
+        with self._lock:
+            if not self._stack:
+                return "Nothing to undo."
+            checkpoint = self._stack.pop()
+        path = Path(checkpoint.path)
+        if checkpoint.prior is None:
+            path.unlink(missing_ok=True)
+            return f"Removed {checkpoint.path} (created this session)."
+        recreated = not path.parent.exists()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(checkpoint.prior)
+        if recreated:
+            return f"Restored {checkpoint.path} (recreated missing parent directories)."
+        return f"Restored {checkpoint.path}."
+
+    def pending(self) -> int:
+        with self._lock:
+            return len(self._stack)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._stack.clear()
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return [checkpoint.as_dict() for checkpoint in self._stack]
+
+    def restore(self, checkpoints: list[dict]) -> None:
+        restored = []
+        for raw in checkpoints:
+            if isinstance(raw, dict):
+                checkpoint = Checkpoint.from_dict(raw)
+                if checkpoint is not None:
+                    restored.append(checkpoint)
+        with self._lock:
+            self._stack = restored
+
+
+# Backwards-compatible process-global manager for directly constructed Tools.
+DEFAULT_MANAGER = CheckpointManager()
 
 
 def record(path: Path) -> None:
-    """Capture the pre-mutation state of path. Call right before writing."""
-    _stack.append((str(path), path.read_bytes() if path.exists() else None))
+    DEFAULT_MANAGER.record(path)
 
 
 def undo() -> str:
-    """Restore the most recent checkpoint."""
-    if not _stack:
-        return "Nothing to undo."
-    path_str, prior = _stack.pop()
-    p = Path(path_str)
-    if prior is None:
-        p.unlink(missing_ok=True)
-        return f"Removed {path_str} (created this session)."
-    # the parent tree may be gone by now: bash side effects are untracked, so
-    # recreate it instead of dying on FileNotFoundError
-    recreated = not p.parent.exists()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(prior)
-    if recreated:
-        return f"Restored {path_str} (recreated missing parent directories)."
-    return f"Restored {path_str}."
+    return DEFAULT_MANAGER.undo()
 
 
 def pending() -> int:
-    return len(_stack)
+    return DEFAULT_MANAGER.pending()
 
 
 def clear() -> None:
-    _stack.clear()
+    DEFAULT_MANAGER.clear()
+
+
+__all__ = [
+    "DEFAULT_MANAGER",
+    "Checkpoint",
+    "CheckpointManager",
+    "clear",
+    "pending",
+    "record",
+    "undo",
+]

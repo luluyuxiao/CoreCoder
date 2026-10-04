@@ -19,13 +19,16 @@ import uuid
 from pathlib import Path
 
 from .capabilities import CapabilityPolicy
+from .checkpoints import CheckpointManager
 from .context import ContextManager, estimate_request_tokens, estimate_tokens
+from .decisions import ToolDecision, coerce_decision
 from .llm import LLM
 from .memory import MemoryState
 from .permissions import Permission
 from .prompt import PLAN_MODE_PROMPT, system_prompt
+from .resources import ResourceClaim, ResourceLockManager
 from .tools import build_tools
-from .tools.agent import AgentStatusTool, AgentTool
+from .tools.agent import AgentResumeTool, AgentStatusTool, AgentTool
 from .tools.base import Tool
 from .tools.memory import MemoryUpdateTool
 from .tools.skill import LoadSkillTool
@@ -53,6 +56,7 @@ class Agent:
         state_callback=None,
         capability_policy: CapabilityPolicy | None = None,
         memory_state: MemoryState | None = None,
+        resource_locks: ResourceLockManager | None = None,
     ):
         self.llm = llm
         self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
@@ -64,6 +68,7 @@ class Agent:
         # provider-valid snapshots; the CLI decides whether SQLite, JSON, or
         # another backend receives them.
         self._state_callback = state_callback
+        self._persist_lock = threading.RLock()
         # Transcript events are independent from ``messages``.  Context
         # management may destructively summarize ``messages`` for the next
         # model request, while these pending events preserve the original
@@ -80,6 +85,7 @@ class Agent:
         # calls keeps that mutable accounting correct while tool phases can
         # still overlap in background mode.
         self._llm_lock = llm_lock or threading.RLock()
+        self._resource_locks = resource_locks or ResourceLockManager()
         self.tools = tools if tools is not None else build_tools()
         self.permission = permission
         self.hooks = hooks
@@ -115,14 +121,58 @@ class Agent:
 
         # wire up sub-agent capability
         for t in self.tools:
-            if isinstance(t, (AgentTool, AgentStatusTool)):
+            if isinstance(t, (AgentTool, AgentStatusTool, AgentResumeTool)):
                 t._parent_agent = self
             if isinstance(t, MemoryUpdateTool):
                 t.bind(self.memory)
-            if not t.is_concurrency_safe():
-                t.execution_lock()  # create before any background worker can share it
+            # Create eagerly without probing argument-dependent resource claims.
+            # The lock is cheap and custom tools may require real arguments to
+            # compute their scheduling group.
+            t.execution_lock()
 
         self._todo = next((t for t in self.tools if isinstance(t, TodoWriteTool)), None)
+        checkpoint_managers = [
+            manager for manager in (
+                getattr(tool, "checkpoints", None) for tool in self.tools
+            )
+            if isinstance(manager, CheckpointManager)
+        ]
+        self.checkpoints = checkpoint_managers[0] if checkpoint_managers else CheckpointManager()
+
+    def replace_tools(self, tools: list[Tool]):
+        """Atomically rebuild the instance-level capability registry.
+
+        MCP dynamic refresh uses this rather than mutating ``tools`` in place,
+        so schema lookup and the generated system prompt always describe the
+        same registry.
+        """
+        updated = list(tools)
+        by_name = {tool.name: tool for tool in updated}
+        if len(by_name) != len(updated):
+            raise ValueError("tool names must be unique")
+        for tool in updated:
+            if isinstance(tool, (AgentTool, AgentStatusTool, AgentResumeTool)):
+                tool._parent_agent = self
+            if isinstance(tool, MemoryUpdateTool):
+                tool.bind(self.memory)
+            tool.execution_lock()
+        self.tools = updated
+        self._tool_by_name = by_name
+        self._skill_loader = next(
+            (tool for tool in updated if isinstance(tool, LoadSkillTool)), None
+        )
+        self._todo = next(
+            (tool for tool in updated if isinstance(tool, TodoWriteTool)), None
+        )
+        managers = [
+            manager for manager in (
+                getattr(tool, "checkpoints", None) for tool in updated
+            )
+            if isinstance(manager, CheckpointManager)
+        ]
+        if managers:
+            self.checkpoints = managers[0]
+        self._system = system_prompt(self.tools, cwd=self.workspace)
 
     def _full_messages(self) -> list[dict]:
         system = self._system
@@ -340,7 +390,8 @@ class Agent:
                     self._trace_tool_requested(tc)
                     if on_tool:
                         on_tool(tc.name, tc.arguments)
-                    result = self._gate_tool(tc)
+                    decision = self._gate_tool(tc)
+                    result = decision.result
                     self._start_tool_progress(
                         [tc], on_tool_progress, parallel=False
                     )
@@ -497,12 +548,24 @@ class Agent:
             "usage_by_model": copy.deepcopy(
                 getattr(self.llm, "usage_by_model", {})
             ),
+            "usage_by_route": copy.deepcopy(
+                getattr(self.llm, "usage_by_route", {})
+            ),
             "fallback_history": copy.deepcopy(
                 getattr(self.llm, "fallback_history", [])
             ),
             "active_skills": self.active_skill_states(),
             "memory_state": self.memory.to_dict(),
+            "checkpoints": self.checkpoints.snapshot(),
         }
+        active_route = getattr(self.llm, "active_route", None)
+        if active_route is not None and hasattr(active_route, "public_dict"):
+            metadata["active_provider_route"] = active_route.public_dict()
+        agent_tool = next(
+            (tool for tool in self.tools if isinstance(tool, AgentTool)), None
+        )
+        if agent_tool is not None and hasattr(agent_tool, "snapshot_jobs"):
+            metadata["background_jobs"] = agent_tool.snapshot_jobs()
         if self._todo is not None:
             metadata["todo_tasks"] = self._todo.snapshot()
         return {
@@ -537,12 +600,32 @@ class Agent:
         metadata = dict(snapshot.get("metadata") or {})
         if hasattr(self.llm, "usage_by_model"):
             self.llm.usage_by_model = copy.deepcopy(metadata.get("usage_by_model") or {})
+        if hasattr(self.llm, "usage_by_route"):
+            self.llm.usage_by_route = copy.deepcopy(metadata.get("usage_by_route") or {})
         if hasattr(self.llm, "fallback_history"):
             self.llm.fallback_history = copy.deepcopy(
                 metadata.get("fallback_history") or []
             )
+        saved_route = metadata.get("active_provider_route")
+        if restore_model and isinstance(saved_route, dict):
+            routes = getattr(self.llm, "routes", [])
+            matched = next(
+                (
+                    route for route in routes
+                    if route.model == saved_route.get("model")
+                    and route.provider == saved_route.get("provider")
+                    and route.base_url == saved_route.get("base_url")
+                ),
+                None,
+            )
+            activate = getattr(self.llm, "_activate_route", None)
+            if matched is not None and callable(activate):
+                activate(matched)
         self.plan_mode = bool(metadata.get("plan_mode", False))
         self.memory = MemoryState.from_dict(metadata.get("memory_state"))
+        raw_checkpoints = metadata.get("checkpoints")
+        if isinstance(raw_checkpoints, list):
+            self.checkpoints.restore(raw_checkpoints)
         for tool in self.tools:
             if isinstance(tool, MemoryUpdateTool):
                 tool.bind(self.memory)
@@ -564,29 +647,73 @@ class Agent:
             tasks = metadata.get("todo_tasks")
             if isinstance(tasks, list):
                 self._todo.restore(tasks)
+        agent_tool = next(
+            (tool for tool in self.tools if isinstance(tool, AgentTool)), None
+        )
+        raw_jobs = metadata.get("background_jobs")
+        if (
+            agent_tool is not None
+            and isinstance(raw_jobs, list)
+            and hasattr(agent_tool, "restore_jobs")
+        ):
+            agent_tool.restore_jobs(raw_jobs)
 
     def persist_state(self, status: str = "saved") -> bool:
         """Best-effort persistence hook; storage failure never kills the run."""
         if self._state_callback is None:
             return False
-        snapshot = self.state_snapshot(status)
-        try:
-            self._state_callback(snapshot)
-            self.acknowledge_persisted(snapshot)
-            self._trace(
-                "session.state.saved",
-                status=status,
-                message_count=len(self.messages),
-            )
-            return True
-        except Exception as e:  # noqa: BLE001
-            log.warning("session state callback failed: %s", e)
-            self._trace(
-                "session.state.failed",
-                status=status,
-                error_type=type(e).__name__,
-            )
-            return False
+        # Background job transitions may save concurrently with the main loop.
+        # Serialize snapshot creation and commit so an older captured job state
+        # cannot overwrite a newer one after a slower database transaction.
+        with self._persist_lock:
+            snapshot = self.state_snapshot(status)
+            try:
+                self._state_callback(snapshot)
+                self.acknowledge_persisted(snapshot)
+                self._trace(
+                    "session.state.saved",
+                    status=status,
+                    message_count=len(self.messages),
+                )
+                return True
+            except Exception as e:  # noqa: BLE001
+                log.warning("session state callback failed: %s", e)
+                self._trace(
+                    "session.state.failed",
+                    status=status,
+                    error_type=type(e).__name__,
+                )
+                return False
+
+    def provider_valid_state(self) -> bool:
+        """Whether Active Context has one result for every requested Tool.
+
+        Background lifecycle updates use this guard before saving the parent:
+        a job may change state while the main loop is still filling a tool
+        batch, and such a half-batch cannot be resumed by chat providers.
+        """
+        pending: set[str] = set()
+        for message in self.messages:
+            if pending:
+                if message.get("role") != "tool":
+                    return False
+                call_id = str(message.get("tool_call_id") or "")
+                if call_id not in pending:
+                    return False
+                pending.remove(call_id)
+                continue
+            if message.get("role") == "tool":
+                return False
+            calls = message.get("tool_calls") or []
+            if calls:
+                pending = {
+                    str(call.get("id") or "")
+                    for call in calls
+                    if isinstance(call, dict)
+                }
+                if "" in pending or not pending:
+                    return False
+        return not pending
 
     def acknowledge_persisted(self, snapshot: dict):
         """Forget only the pending records included in a successful save.
@@ -675,26 +802,44 @@ class Agent:
             ),
         }
 
-    def _has_parallel_work(self, tool_calls, gated_results) -> bool:
+    def _parallel_group(self, tc) -> str | None:
+        tool = self._tool_by_name.get(tc.name)
+        return tool.parallel_group(tc.arguments) if tool is not None else None
+
+    def _resource_claims(self, tc) -> tuple[ResourceClaim, ...]:
+        tool = self._tool_by_name.get(tc.name)
+        if tool is None:
+            return ()
+        try:
+            return tuple(tool.resource_claims(tc.arguments))
+        except Exception as error:  # noqa: BLE001
+            log.warning("resource claims failed for %s: %s", tc.name, error)
+            return (ResourceClaim(f"tool:{tc.name}", "write"),)
+
+    def _has_parallel_work(self, tool_calls, gated_decisions) -> bool:
         """Return whether scheduling will contain a concurrent safe batch."""
         pending = [
-            i for i, result in enumerate(gated_results) if result is None
+            i for i, decision in enumerate(gated_decisions) if decision.allowed
         ]
         cursor = 0
         while cursor < len(pending):
             index = pending[cursor]
-            tool = self._tool_by_name.get(tool_calls[index].name)
-            if tool is None or not tool.is_concurrency_safe():
+            group = self._parallel_group(tool_calls[index])
+            if group is None:
                 cursor += 1
                 continue
+            claims = list(self._resource_claims(tool_calls[index]))
             batch_size = 1
             cursor += 1
             while cursor < len(pending):
                 candidate = pending[cursor]
-                candidate_tool = self._tool_by_name.get(tool_calls[candidate].name)
-                if candidate_tool is None or not candidate_tool.is_concurrency_safe():
+                if self._parallel_group(tool_calls[candidate]) != group:
+                    break
+                candidate_claims = self._resource_claims(tool_calls[candidate])
+                if ResourceLockManager.conflict(claims, candidate_claims):
                     break
                 batch_size += 1
+                claims.extend(candidate_claims)
                 cursor += 1
             if batch_size > 1:
                 return True
@@ -735,83 +880,118 @@ class Agent:
             parallel=parallel,
         )
 
-    def _gate_tool(self, tc) -> str | None:
+    def _gate_tool(self, tc) -> ToolDecision:
         hook_started = time.perf_counter()
-        result = self._pre_hooks(tc)
+        decision = self._pre_hook_decision(tc)
         self._trace(
             "hook.pre.completed",
             tool_call_id=tc.id,
             tool_name=tc.name,
             configured=self.hooks is not None,
-            blocked=result is not None,
+            decision=decision.code,
+            blocked=not decision.allowed,
             duration_ms=round((time.perf_counter() - hook_started) * 1000, 3),
         )
-        if result is not None:
+        if not decision.allowed:
             self._trace(
                 "tool.blocked",
                 tool_call_id=tc.id,
                 tool_name=tc.name,
                 gate="hook",
-                **self._trace_content(result=result),
+                **self._trace_content(result=decision.reason),
             )
-            return result
+            return decision
         capability_started = time.perf_counter()
-        decision, result = self._capability_decision(tc)
+        decision = self._capability_decision(tc)
         self._trace(
             "tool.capability_decided",
             tool_call_id=tc.id,
             tool_name=tc.name,
-            decision=decision,
-            allowed=result is None,
+            decision=decision.code,
+            allowed=decision.allowed,
             duration_ms=round((time.perf_counter() - capability_started) * 1000, 3),
-            **(self._trace_content(result=result) if result is not None else {}),
+            **(
+                self._trace_content(result=decision.reason)
+                if not decision.allowed else {}
+            ),
         )
-        if result is not None:
+        if not decision.allowed:
             self._trace(
                 "tool.blocked",
                 tool_call_id=tc.id,
                 tool_name=tc.name,
                 gate="capability",
-                **self._trace_content(result=result),
+                **self._trace_content(result=decision.reason),
             )
-            return result
+            return decision
         permission_started = time.perf_counter()
-        decision, result = self._permission_decision(tc)
-        content_fields = self._trace_content(result=result) if result is not None else {}
+        decision = self._permission_decision(tc)
+        content_fields = (
+            self._trace_content(result=decision.reason)
+            if not decision.allowed else {}
+        )
         self._trace(
             "tool.permission_decided",
             tool_call_id=tc.id,
             tool_name=tc.name,
-            decision=decision,
-            allowed=result is None,
+            decision=decision.code,
+            allowed=decision.allowed,
             duration_ms=round((time.perf_counter() - permission_started) * 1000, 3),
             **content_fields,
         )
-        return result
+        return decision
 
-    def _capability_decision(self, tc) -> tuple[str, str | None]:
+    def _capability_decision(self, tc) -> ToolDecision:
         tool = self._tool_by_name.get(tc.name)
         if tool is None:
-            return "unknown_tool", None
-        return self.capability_policy.decide(tool, tc.arguments)
+            return ToolDecision.allow("capability", "unknown_tool")
+        return coerce_decision(
+            self.capability_policy.decide(tool, tc.arguments),
+            gate="capability",
+            allow_code="capability_allow",
+            deny_code="capability_deny",
+        )
 
-    def _permission_decision(self, tc) -> tuple[str, str | None]:
+    def _permission_decision(self, tc) -> ToolDecision:
         if self.plan_mode and tc.name not in Permission.READ_ONLY:
-            return "plan_deny", self._permit(tc)
+            return ToolDecision.deny("plan", "plan_deny", self._permit(tc) or "Plan mode denied the call")
         if self.permission is None:
-            return "no_permission_layer", None
+            return ToolDecision.allow("permission", "no_permission_layer")
         decide = getattr(self.permission, "decide", None)
         if callable(decide):
-            return decide(tc.name, tc.arguments)
+            return coerce_decision(
+                decide(tc.name, tc.arguments),
+                gate="permission",
+                allow_code="custom_allow",
+                deny_code="custom_deny",
+            )
         result = self.permission.check(tc.name, tc.arguments)
-        return ("custom_deny" if result is not None else "custom_allow"), result
+        return coerce_decision(
+            result,
+            gate="permission",
+            allow_code="custom_allow",
+            deny_code="custom_deny",
+        )
+
+    def _pre_hook_decision(self, tc) -> ToolDecision:
+        if self.hooks is None:
+            return ToolDecision.allow("hook", "no_hooks")
+        decide = getattr(self.hooks, "decide_pre", None)
+        value = (
+            decide(tc.name, tc.arguments)
+            if callable(decide) else self.hooks.run_pre(tc.name, tc.arguments)
+        )
+        return coerce_decision(
+            value,
+            gate="hook",
+            allow_code="hook_allow",
+            deny_code="hook_veto",
+        )
 
     def _pre_hooks(self, tc) -> str | None:
         """PreToolUse hooks, fired before consent. A string return blocks the
         call and becomes the tool result the model sees; None lets it through."""
-        if self.hooks is None:
-            return None
-        return self.hooks.run_pre(tc.name, tc.arguments)
+        return self._pre_hook_decision(tc).result
 
     def _post_hooks(self, tc, result: str):
         """PostToolUse hooks observe a finished call; they can never block."""
@@ -898,11 +1078,13 @@ class Agent:
             # Separate Agents may share MCP/custom Tool instances. Unsafe
             # effects use an instance lock so background sub-agents cannot race
             # the parent through that second concurrency entrance.
-            if tool.is_concurrency_safe():
-                result = tool.execute(**tc.arguments)
-            else:
-                with tool.execution_lock():
+            claims = self._resource_claims(tc)
+            with self._resource_locks.acquire(claims):
+                if tool.parallel_group(tc.arguments) is not None:
                     result = tool.execute(**tc.arguments)
+                else:
+                    with tool.execution_lock():
+                        result = tool.execute(**tc.arguments)
             return finish(result)
         except Exception as e:  # noqa: BLE001
             return finish(f"Error executing {tc.name}: {e}")
@@ -943,23 +1125,24 @@ class Agent:
 
         # hooks and consent are settled up front on this thread: prompting
         # from pool workers would interleave several prompts on one terminal
-        results = [self._gate_tool(tc) for tc in tool_calls]
-        parallel = self._has_parallel_work(tool_calls, results)
+        decisions = [self._gate_tool(tc) for tc in tool_calls]
+        parallel = self._has_parallel_work(tool_calls, decisions)
         self._start_tool_progress(
             tool_calls, on_tool_progress, parallel=parallel
         )
-        for tc, result in zip(tool_calls, results):
-            if result is not None:
-                self._finish_blocked_tool_progress(tc, result, on_tool_progress)
-        pending = [i for i, result in enumerate(results) if result is None]
+        results = [decision.result for decision in decisions]
+        for tc, decision in zip(tool_calls, decisions):
+            if not decision.allowed:
+                self._finish_blocked_tool_progress(tc, decision.reason, on_tool_progress)
+        pending = [i for i, decision in enumerate(decisions) if decision.allowed]
         cursor = 0
         while cursor < len(pending):
             index = pending[cursor]
-            tool = self._tool_by_name.get(tool_calls[index].name)
+            group = self._parallel_group(tool_calls[index])
 
-            # Unknown tools and any tool not explicitly marked safe are an
-            # exclusive barrier. _exec_tool still owns the unknown-tool error.
-            if tool is None or not tool.is_concurrency_safe():
+            # Unknown tools and calls without resource-safe parallel metadata
+            # are exclusive barriers. _exec_tool still owns unknown-tool errors.
+            if group is None:
                 results[index] = self._exec_tool(
                     tool_calls[index], on_tool_progress
                 )
@@ -967,15 +1150,20 @@ class Agent:
                 cursor += 1
                 continue
 
-            # Form one maximal, consecutive batch of explicitly safe calls.
+            # Form one maximal consecutive batch in the same scheduling group
+            # whose read/write resource claims do not conflict.
             batch = [index]
+            claims = list(self._resource_claims(tool_calls[index]))
             cursor += 1
             while cursor < len(pending):
                 candidate = pending[cursor]
-                candidate_tool = self._tool_by_name.get(tool_calls[candidate].name)
-                if candidate_tool is None or not candidate_tool.is_concurrency_safe():
+                if self._parallel_group(tool_calls[candidate]) != group:
+                    break
+                candidate_claims = self._resource_claims(tool_calls[candidate])
+                if ResourceLockManager.conflict(claims, candidate_claims):
                     break
                 batch.append(candidate)
+                claims.extend(candidate_claims)
                 cursor += 1
 
             if len(batch) == 1:
@@ -1028,4 +1216,5 @@ class Agent:
         self._unconsumed_tool_call_ids.clear()
         self.active_skills.clear()
         self.memory.clear()
+        self.checkpoints.clear()
         self.persist_state("reset")

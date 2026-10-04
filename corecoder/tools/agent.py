@@ -19,11 +19,12 @@ from pathlib import Path
 from typing import ClassVar
 
 from ..capabilities import SUBAGENT
+from ..checkpoints import CheckpointManager
 from ..sandbox import WorkspacePathPolicy, command_executor_for_workspace
 from .base import Tool, ToolEffect
 
 WORKTREES_DIR = Path.home() / ".corecoder" / "worktrees"
-_CONTROL_TOOLS = frozenset({"agent", "agent_status"})
+_CONTROL_TOOLS = frozenset({"agent", "agent_status", "agent_resume"})
 _MAX_ACTIVE_BACKGROUND = 4
 _MAX_RETAINED_JOBS = 32
 
@@ -47,6 +48,52 @@ class _Job:
     finished_at: float | None = None
     done: threading.Event = field(default_factory=threading.Event)
 
+    def as_dict(self) -> dict:
+        """Return the durable, thread-free representation saved in a session."""
+        return {
+            "id": self.id,
+            "task": self.task,
+            "isolation": self.isolation,
+            "status": self.status,
+            "result": self.result,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> _Job | None:
+        try:
+            task_id = str(raw["id"])
+            task = str(raw["task"])
+            isolation = str(raw.get("isolation") or "shared")
+            status = str(raw.get("status") or "interrupted")
+            if not task_id or not task or isolation not in {"shared", "worktree"}:
+                return None
+            if status not in {"queued", "running", "completed", "failed", "interrupted"}:
+                status = "interrupted"
+            job = cls(
+                id=task_id,
+                task=task,
+                isolation=isolation,
+                status=status,
+                result=str(raw.get("result") or ""),
+                created_at=float(raw.get("created_at") or time.time()),
+                started_at=(
+                    float(raw["started_at"])
+                    if raw.get("started_at") is not None else None
+                ),
+                finished_at=(
+                    float(raw["finished_at"])
+                    if raw.get("finished_at") is not None else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        if job.status in {"completed", "failed", "interrupted"}:
+            job.done.set()
+        return job
+
 
 class AgentTool(Tool):
     name = "agent"
@@ -57,7 +104,9 @@ class AgentTool(Tool):
         "run_mode=foreground waits for the result; background returns a task ID "
         "for agent_status. isolation=shared uses the current checkout; worktree "
         "creates an independent Git branch from HEAD. Background workers cannot "
-        "open permission prompts, so mutating tools must already be pre-approved."
+        "open permission prompts, so mutating tools must already be pre-approved. "
+        "Job records are saved with the parent session; interrupted work is only "
+        "restarted after an explicit agent_resume call."
     )
     parameters: ClassVar[dict] = {
         "type": "object",
@@ -162,6 +211,12 @@ class AgentTool(Tool):
             started_at = job.started_at
         if status in {"completed", "failed"}:
             return f"[Background sub-agent {status}: {job.id}]\n{result}"
+        if status == "interrupted":
+            detail = result or "The process exited before this job reached a terminal state."
+            return (
+                f"[Background sub-agent interrupted: {job.id}]\n{detail}\n"
+                f"Use agent_resume(task_id={job.id!r}) to restart it explicitly."
+            )
         elapsed = time.time() - (started_at or job.created_at)
         return f"Background sub-agent {job.id}: {status} ({elapsed:.1f}s elapsed)"
 
@@ -177,6 +232,8 @@ class AgentTool(Tool):
             task_id = uuid.uuid4().hex[:12]
             job = _Job(id=task_id, task=task, isolation=isolation)
             self._jobs[task_id] = job
+
+        self._persist_parent()
 
         thread = threading.Thread(
             target=self._background_main,
@@ -202,6 +259,10 @@ class AgentTool(Tool):
         with self._jobs_lock:
             job.status = "running"
             job.started_at = time.time()
+            job.finished_at = None
+            job.result = ""
+            job.done.clear()
+        self._persist_parent()
         try:
             result = self._run(job.task, job.isolation, job.id, background=True)
             status = "completed"
@@ -213,6 +274,7 @@ class AgentTool(Tool):
             job.status = status
             job.finished_at = time.time()
             job.done.set()
+        self._persist_parent()
         self._trace_parent(
             f"subagent.{status}",
             task_id=job.id,
@@ -267,6 +329,7 @@ class AgentTool(Tool):
                 subagent_task_id=task_id,
                 capability_policy=parent.capability_policy,
                 memory_state=child_memory,
+                resource_locks=parent._resource_locks,
             )
             result = sub.chat(task)
         except Exception as e:
@@ -294,7 +357,7 @@ class AgentTool(Tool):
         if len(self._jobs) < _MAX_RETAINED_JOBS:
             return
         for task_id in list(self._jobs):
-            if self._jobs[task_id].status in {"completed", "failed"}:
+            if self._jobs[task_id].status in {"completed", "failed", "interrupted"}:
                 del self._jobs[task_id]
                 if len(self._jobs) < _MAX_RETAINED_JOBS:
                     return
@@ -302,6 +365,85 @@ class AgentTool(Tool):
     def _trace_parent(self, event: str, **fields):
         if self._parent_agent is not None:
             self._parent_agent._trace(event, **fields)
+
+    def _persist_parent(self):
+        if (
+            self._parent_agent is not None
+            and self._parent_agent.provider_valid_state()
+        ):
+            self._parent_agent.persist_state("running")
+
+    def snapshot_jobs(self) -> list[dict]:
+        """Return a stable copy suitable for ``Agent.state_snapshot``."""
+        with self._jobs_lock:
+            return [job.as_dict() for job in self._jobs.values()]
+
+    def restore_jobs(self, records: list[dict]):
+        """Restore retained jobs without silently repeating their side effects.
+
+        A process cannot reattach Python threads after restart. Saved queued or
+        running jobs therefore become ``interrupted`` and require the explicit,
+        permission-gated ``agent_resume`` tool before they are run again.
+        """
+        restored: dict[str, _Job] = {}
+        for raw in records[-_MAX_RETAINED_JOBS:]:
+            if not isinstance(raw, dict):
+                continue
+            job = _Job.from_dict(raw)
+            if job is None:
+                continue
+            if job.status in {"queued", "running"}:
+                previous = job.status
+                job.status = "interrupted"
+                job.result = (
+                    f"Restored from a session while previously {previous}; "
+                    "not automatically replayed to avoid duplicate side effects."
+                )
+                job.finished_at = time.time()
+                job.done.set()
+            restored[job.id] = job
+        with self._jobs_lock:
+            self._jobs = restored
+
+    def resume(self, task_id: str) -> str:
+        """Explicitly restart one interrupted/failed background task."""
+        with self._jobs_lock:
+            job = self._jobs.get(task_id)
+            if job is None:
+                return f"Error: unknown background sub-agent task {task_id!r}"
+            if job.status not in {"interrupted", "failed"}:
+                return (
+                    f"Error: background sub-agent {task_id!r} is {job.status}; "
+                    "only interrupted or failed jobs can be resumed"
+                )
+            active = sum(
+                item.status in {"queued", "running"} for item in self._jobs.values()
+            )
+            if active >= _MAX_ACTIVE_BACKGROUND:
+                return f"Error: {_MAX_ACTIVE_BACKGROUND} background sub-agents are already active"
+            job.status = "queued"
+            job.result = ""
+            job.started_at = None
+            job.finished_at = None
+            job.done.clear()
+        self._persist_parent()
+        thread = threading.Thread(
+            target=self._background_main,
+            args=(job,),
+            name=f"corecoder-subagent-{task_id}",
+            daemon=True,
+        )
+        thread.start()
+        self._trace_parent(
+            "subagent.resumed",
+            task_id=task_id,
+            run_mode="background",
+            isolation=job.isolation,
+        )
+        return (
+            f"[Sub-agent resumed in background]\nTask ID: {task_id}\n"
+            f"Isolation: {job.isolation}\nUse agent_status to poll."
+        )
 
 
 class AgentStatusTool(Tool):
@@ -312,7 +454,8 @@ class AgentStatusTool(Tool):
     capabilities = frozenset()
     description = (
         "List background sub-agents or read one result. Supply wait_seconds to "
-        "wait briefly. Jobs are in-process and do not survive CoreCoder exiting."
+        "wait briefly. Job records survive Session Resume; unfinished jobs are "
+        "marked interrupted rather than silently replayed."
     )
     parameters: ClassVar[dict] = {
         "type": "object",
@@ -346,8 +489,45 @@ class AgentStatusTool(Tool):
         return manager.status(task_id, wait_seconds)
 
 
+class AgentResumeTool(Tool):
+    """Permission-gated explicit restart for a persisted interrupted job."""
+
+    name = "agent_resume"
+    effect = ToolEffect.EXTERNAL
+    capabilities = frozenset({SUBAGENT})
+    description = (
+        "Restart an interrupted or failed persisted background sub-agent. "
+        "This is explicit because automatically replaying a task could repeat "
+        "file writes, commands, or external side effects."
+    )
+    parameters: ClassVar[dict] = {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Persisted background task ID to restart",
+            },
+        },
+        "required": ["task_id"],
+    }
+
+    def __init__(self):
+        self._parent_agent = None
+
+    def execute(self, task_id: str) -> str:
+        if self._parent_agent is None:
+            return "Error: agent_resume tool not initialized (no parent agent)"
+        manager = next(
+            (tool for tool in self._parent_agent.tools if isinstance(tool, AgentTool)),
+            None,
+        )
+        if manager is None:
+            return "Error: no agent tool is registered on this Agent"
+        return manager.resume(task_id)
+
+
 def _create_worktree(workspace: Path, task_id: str) -> _Worktree:
-    """Create a retained branch/worktree from the repository's current HEAD."""
+    """Create or reopen a retained worktree for a durable task ID."""
     repo_result = _git(workspace, "rev-parse", "--show-toplevel")
     if repo_result.returncode != 0:
         raise RuntimeError("worktree isolation requires the current workspace to be a Git repository")
@@ -356,7 +536,18 @@ def _create_worktree(workspace: Path, task_id: str) -> _Worktree:
     path = WORKTREES_DIR / f"{repo.name}-{digest}" / task_id
     branch = f"corecoder/subagent-{task_id}"
     path.parent.mkdir(parents=True, exist_ok=True)
-    added = _git(repo, "worktree", "add", "-b", branch, os.fspath(path), "HEAD")
+    if path.is_dir():
+        existing = _git(path, "rev-parse", "--show-toplevel")
+        if existing.returncode == 0 and Path(existing.stdout.strip()).resolve() == path.resolve():
+            return _Worktree(path=path.resolve(), branch=branch, repo=repo)
+        raise RuntimeError(f"retained worktree path is occupied: {path}")
+    branch_exists = _git(repo, "show-ref", "--verify", f"refs/heads/{branch}")
+    args = (
+        ("worktree", "add", os.fspath(path), branch)
+        if branch_exists.returncode == 0
+        else ("worktree", "add", "-b", branch, os.fspath(path), "HEAD")
+    )
+    added = _git(repo, *args)
     if added.returncode != 0:
         detail = (added.stderr or added.stdout).strip()
         raise RuntimeError(f"could not create Git worktree: {detail}")
@@ -403,6 +594,7 @@ def _subagent_tools(tools: list[Tool], workspace: Path, isolated: bool) -> list[
     from .write import WriteFileTool
 
     cloned: list[Tool] = []
+    checkpoints = CheckpointManager()
     for tool in tools:
         if tool.name in _CONTROL_TOOLS:
             continue  # no recursive descendants and no orphan status tool
@@ -417,9 +609,15 @@ def _subagent_tools(tools: list[Tool], workspace: Path, isolated: bool) -> list[
         elif isinstance(tool, ReadFileTool):
             cloned.append(ReadFileTool(_path_policy(tool, workspace, isolated)))
         elif isinstance(tool, WriteFileTool):
-            cloned.append(WriteFileTool(_path_policy(tool, workspace, isolated)))
+            cloned.append(WriteFileTool(
+                _path_policy(tool, workspace, isolated),
+                checkpoint_manager=checkpoints,
+            ))
         elif isinstance(tool, EditFileTool):
-            cloned.append(EditFileTool(_path_policy(tool, workspace, isolated)))
+            cloned.append(EditFileTool(
+                _path_policy(tool, workspace, isolated),
+                checkpoint_manager=checkpoints,
+            ))
         elif isinstance(tool, GlobTool):
             cloned.append(GlobTool(_path_policy(tool, workspace, isolated)))
         elif isinstance(tool, GrepTool):

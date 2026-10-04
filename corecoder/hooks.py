@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .decisions import ToolDecision
+
 log = logging.getLogger(__name__)
 
 HOOKS_FILE = Path.home() / ".corecoder" / "hooks.json"
@@ -37,13 +39,22 @@ class Hooks:
     def run_pre(self, tool_name: str, tool_input: dict) -> str | None:
         """Fire matching PreToolUse hooks. A string return blocks the call and
         is what the model gets as the tool result; None means carry on."""
+        return self.decide_pre(tool_name, tool_input).result
+
+    def decide_pre(self, tool_name: str, tool_input: dict) -> ToolDecision:
+        """Return the same structured policy result as other execution gates."""
         payload = {"tool_name": tool_name, "tool_input": tool_input}
         for hook in self.pre:
             out = _fire(hook, payload)
             if out is not None and out.returncode == 2:
                 reason = out.stderr.strip() or "no reason given"
-                return "Blocked by hook: " + reason
-        return None
+                return ToolDecision.deny(
+                    "hook",
+                    "hook_veto",
+                    "Blocked by hook: " + reason,
+                    matcher=str(hook.get("matcher") or ""),
+                )
+        return ToolDecision.allow("hook", "hook_allow")
 
     def run_post(self, tool_name: str, tool_input: dict, result: str):
         """PostToolUse hooks observe a finished call; they can never block."""

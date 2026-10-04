@@ -8,6 +8,7 @@ import concurrent.futures
 import json
 import logging
 import sys
+import urllib.error
 from unittest import mock
 
 import pytest
@@ -20,11 +21,13 @@ from corecoder.capabilities import (
     MCP,
     NETWORK,
     PROCESS,
+    CapabilityPolicy,
+    CapabilityRule,
 )
 from corecoder.demo import ScriptedLLM
 from corecoder.hooks import Hooks
 from corecoder.llm import LLMResponse, ToolCall
-from corecoder.mcp import MCPError, load_mcp_tools
+from corecoder.mcp import MCPError, load_mcp_tools, refresh_mcp_tools
 from corecoder.permissions import Permission
 from corecoder.tools.base import ToolEffect
 
@@ -153,8 +156,9 @@ def test_server_crash_mid_call_fails_without_killing_the_loop(mcp_config):
     crash_result = agent.messages[2]
     assert "Error executing mcp__fake__crash" in crash_result["content"]
     assert "exited" in crash_result["content"]
-    # the server stays dead: the next call on it fails clean too
-    assert "exited" in agent.messages[4]["content"]
+    # A later call reconnects and re-handshakes. The failed tool call itself is
+    # never replayed because it may already have produced a side effect.
+    assert agent.messages[4]["content"] == "echo: hi"
 
 
 def test_a_slow_server_times_out_the_call(mcp_config):
@@ -294,3 +298,145 @@ def test_hooks_match_mcp_tool_names(mcp_config):
 
     assert agent.chat("go") == "done"
     assert "mcp frozen" in agent.messages[2]["content"]
+
+
+class _HTTPResponse:
+    def __init__(self, payload=None, *, headers=None):
+        self.payload = payload
+        self.headers = headers or {"Content-Type": "application/json"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return b"" if self.payload is None else json.dumps(self.payload).encode()
+
+    def close(self):
+        pass
+
+
+def test_streamable_http_handshake_session_and_tool_call(tmp_path, monkeypatch):
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        if request.method == "DELETE":
+            return _HTTPResponse()
+        message = json.loads(request.data)
+        method = message["method"]
+        if "id" not in message:
+            return _HTTPResponse()
+        if method == "initialize":
+            return _HTTPResponse(
+                {"jsonrpc": "2.0", "id": message["id"], "result": {
+                    "protocolVersion": "2025-06-18", "capabilities": {}
+                }},
+                headers={
+                    "Content-Type": "application/json",
+                    "Mcp-Session-Id": "session-1",
+                },
+            )
+        if method == "tools/list":
+            result = {"tools": [{
+                "name": "weather",
+                "description": "Current weather",
+                "inputSchema": {"type": "object", "properties": {
+                    "city": {"type": "string"},
+                }},
+            }]}
+        else:
+            result = {"content": [{"type": "text", "text": "sunny"}]}
+        return _HTTPResponse({
+            "jsonrpc": "2.0", "id": message["id"], "result": result,
+        })
+
+    monkeypatch.setattr("corecoder.mcp.urllib.request.urlopen", urlopen)
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "remote": {"url": "https://mcp.example.test", "headers": {"X-Test": "yes"}},
+    }}))
+
+    tools = load_mcp_tools(cfg)
+    assert [tool.name for tool in tools] == ["mcp__remote__weather"]
+    assert tools[0].execute(city="Shanghai") == "sunny"
+    assert tools[0].capabilities == frozenset({MCP, NETWORK})
+    tool_request = requests[-1]
+    assert tool_request.get_header("Mcp-session-id") == "session-1"
+    assert tool_request.get_header("X-test") == "yes"
+    tools[0]._client.close()
+
+
+def test_mcp_circuit_opens_after_repeated_http_transport_failures(monkeypatch):
+    failing = {"enabled": False}
+
+    def urlopen(request, timeout):
+        if failing["enabled"]:
+            raise urllib.error.URLError("offline")
+        message = json.loads(request.data)
+        if "id" not in message:
+            return _HTTPResponse()
+        result = {"tools": []} if message["method"] == "tools/list" else {}
+        return _HTTPResponse({
+            "jsonrpc": "2.0", "id": message["id"], "result": result,
+        })
+
+    monkeypatch.setattr("corecoder.mcp.urllib.request.urlopen", urlopen)
+    client = mcp.MCPClient(
+        "remote",
+        url="https://mcp.example.test",
+        circuit_failures=2,
+        circuit_cooldown=60,
+    )
+    failing["enabled"] = True
+
+    with pytest.raises(MCPError, match="offline"):
+        client.call_tool("weather", {})
+    with pytest.raises(MCPError, match="offline"):
+        client.call_tool("weather", {})
+    with pytest.raises(MCPError, match="circuit is open"):
+        client.call_tool("weather", {})
+    client.close()
+
+
+def test_capability_policy_denies_mcp_before_process_start(tmp_path, monkeypatch, caplog):
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "blocked": {"command": "must-not-start"},
+    }}))
+    policy = CapabilityPolicy(
+        default="deny",
+        rules=[CapabilityRule("mcp__blocked__*", frozenset({MCP}))],
+    )
+    factory = mock.Mock()
+    monkeypatch.setattr(mcp, "MCPClient", factory)
+
+    with caplog.at_level(logging.WARNING):
+        assert load_mcp_tools(cfg, capability_policy=policy) == []
+
+    factory.assert_not_called()
+    assert "before startup" in caplog.text
+
+
+def test_dynamic_refresh_replaces_schema_without_touching_builtin():
+    client = mock.Mock()
+    client.name = "dynamic"
+    client.capabilities = frozenset({MCP, NETWORK})
+    old = mcp.MCPTool(client, {
+        "name": "old", "inputSchema": {"type": "object", "properties": {}},
+    })
+    new = mcp.MCPTool(client, {
+        "name": "new", "inputSchema": {"type": "object", "properties": {}},
+    })
+    client.refresh_tools.return_value = [new]
+    builtin = mock.Mock(spec=[])  # any non-MCP object is retained by identity
+
+    tools, health = refresh_mcp_tools([builtin, old])
+
+    assert tools == [builtin, new]
+    assert health == [{
+        "name": "dynamic", "transport": client.transport,
+        "status": "healthy", "tool_count": 1,
+    }]

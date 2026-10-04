@@ -86,7 +86,7 @@ def test_public_api_exports():
     assert MemoryState is not None
     assert MemoryTrace is not None
     assert SQLiteSessionStore is not None
-    assert len(ALL_TOOLS) == 12
+    assert len(ALL_TOOLS) == 13
 
 
 def test_config_from_env(monkeypatch):

@@ -1,6 +1,7 @@
 """Interactive REPL - the user-facing terminal interface."""
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -29,7 +30,7 @@ from .capabilities import load_capability_policy
 from .config import Config
 from .hooks import load_hooks
 from .llm import LLM, LiteLLM
-from .mcp import load_mcp_tools
+from .mcp import load_mcp_tools, refresh_mcp_tools
 from .permissions import Permission
 from .sandbox import WorkspacePathPolicy, create_command_executor
 from .session import (
@@ -201,6 +202,18 @@ def _positive_float(value: str) -> float:
     return number
 
 
+def _provider_route(value: str) -> dict:
+    try:
+        route = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"route must be JSON: {error}") from error
+    if not isinstance(route, dict):
+        raise argparse.ArgumentTypeError("route must be a JSON object")
+    if not route.get("model"):
+        raise argparse.ArgumentTypeError("route requires a non-empty model")
+    return route
+
+
 def _parse_args():
     p = argparse.ArgumentParser(
         prog="corecoder",
@@ -212,6 +225,17 @@ def _parse_args():
         action="append",
         dest="fallback_models",
         help="Fallback model after retryable failures; repeat for an ordered chain",
+    )
+    p.add_argument(
+        "--fallback-route",
+        action="append",
+        type=_provider_route,
+        dest="fallback_routes",
+        metavar="JSON",
+        help=(
+            "Fallback provider route JSON; repeat for an ordered chain. "
+            "Supports provider, model, base_url, api_key_env, and price overrides"
+        ),
     )
     p.add_argument(
         "--max-cost",
@@ -273,6 +297,8 @@ def main():
         config.model = args.model
     if args.fallback_models:
         config.fallback_models = args.fallback_models
+    if args.fallback_routes:
+        config.fallback_routes = args.fallback_routes
     if args.max_cost_usd is not None:
         config.max_cost_usd = args.max_cost_usd
     if args.base_url:
@@ -325,6 +351,7 @@ def main():
             api_key=config.api_key,
             base_url=config.base_url,
             fallback_models=config.fallback_models,
+            fallback_routes=config.fallback_routes,
             max_cost_usd=config.max_cost_usd,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
@@ -399,7 +426,10 @@ def main():
                 path_policy=path_policy,
                 skill_registry=skill_registry,
             ),
-            *load_mcp_tools(workspace=Path.cwd()),
+            *load_mcp_tools(
+                workspace=Path.cwd(),
+                capability_policy=capability_policy,
+            ),
         ],
         max_context_tokens=config.max_context_tokens,
         permission=permission,
@@ -508,7 +538,7 @@ def _repl(
         sandbox_mode: sum(
             client.sandbox_mode == sandbox_mode for client in mcp_clients.values()
         )
-        for sandbox_mode in ("docker", "host")
+        for sandbox_mode in ("docker", "host", "remote")
     }
     mcp_mode_text = ", ".join(
         f"{count} {mode}" for mode, count in mcp_modes.items() if count
@@ -518,8 +548,16 @@ def _repl(
         f"Model: [cyan]{config.model}[/cyan]"
         + (f"  Base: [dim]{config.base_url}[/dim]" if config.base_url else "")
         + (
-            f"\nFallbacks: [cyan]{' → '.join(config.fallback_models)}[/cyan]"
-            if config.fallback_models else ""
+            "\nFallbacks: [cyan]"
+            + " → ".join([
+                *config.fallback_models,
+                *[
+                    str(route.get("name") or route.get("model") or "route")
+                    for route in config.fallback_routes
+                ],
+            ])
+            + "[/cyan]"
+            if config.fallback_models or config.fallback_routes else ""
         )
         + (
             f"\nUSD budget: [cyan]${config.max_cost_usd:.4f}[/cyan]"
@@ -631,7 +669,13 @@ def _repl(
                     f"  budget ${agent.llm.max_cost_usd:.4f}, "
                     + (f"${remaining:.4f} left" if remaining is not None else "cost unavailable")
                 )
-            if agent.llm.fallback_history:
+            active_route = getattr(agent.llm, "active_route", None)
+            if active_route is not None:
+                line += (
+                    f"  active: {active_route.provider}/{active_route.model}"
+                    f" ({active_route.route_id})"
+                )
+            elif agent.llm.fallback_history:
                 line += f"  active model: {agent.llm.model}"
             console.print(line)
             continue
@@ -785,9 +829,8 @@ def _repl(
                     console.print(f"  [cyan]{escape(file_path)}[/cyan]")
             continue
         if user_input == "/undo":
-            from .checkpoints import pending, undo
-            console.print(undo())
-            left = pending()
+            console.print(agent.checkpoints.undo())
+            left = agent.checkpoints.pending()
             if left:
                 console.print(f"[dim]{left} more checkpoint(s) on the stack.[/dim]")
             continue
@@ -885,6 +928,24 @@ def _repl(
             status_tool = next((t for t in agent.tools if t.name == "agent_status"), None)
             console.print(status_tool.execute() if status_tool else "[dim]Sub-agents are disabled.[/dim]")
             continue
+        if user_input == "/mcp-refresh":
+            refreshed, health = refresh_mcp_tools(agent.tools)
+            agent.replace_tools(refreshed)
+            if not health:
+                console.print("[dim]No active MCP servers.[/dim]")
+            else:
+                for item in health:
+                    status = item["status"]
+                    color = "green" if status == "healthy" else "yellow"
+                    detail = (
+                        f" — {escape(str(item['error']))}"
+                        if item.get("error") else ""
+                    )
+                    console.print(
+                        f"[{color}]{escape(str(item['name']))}: {status}[/] "
+                        f"({item['tool_count']} tools, {item['transport']}){detail}"
+                    )
+            continue
 
         # an unknown /command shouldn't be sent to the model as a prompt
         if user_input.startswith("/"):
@@ -946,6 +1007,7 @@ def _show_help():
         "  /transcript [id]  Show the append-only original event history\n"
         "  /delete-session <id>  Delete an inactive session\n"
         "  /agents        List background sub-agents\n"
+        "  /mcp-refresh   Reconnect if needed and refresh MCP tool schemas\n"
         "  quit           Exit CoreCoder\n"
         "\n"
         "[bold]Input:[/bold]\n"

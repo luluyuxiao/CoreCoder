@@ -2,8 +2,9 @@
 
 from typing import TYPE_CHECKING
 
+from ..checkpoints import CheckpointManager
 from ..sandbox import CommandExecutor, WorkspacePathPolicy
-from .agent import AgentStatusTool, AgentTool
+from .agent import AgentResumeTool, AgentStatusTool, AgentTool
 from .bash import BashTool
 from .edit import EditFileTool
 from .fetch import FetchUrlTool
@@ -24,18 +25,21 @@ def build_tools(
     executor: CommandExecutor | None = None,
     path_policy: WorkspacePathPolicy | None = None,
     skill_registry: "SkillRegistry | None" = None,
+    checkpoint_manager: CheckpointManager | None = None,
 ):
     """Create a fresh tool set, optionally bound to a sandbox policy."""
+    checkpoints = checkpoint_manager or CheckpointManager()
     tools = [
         BashTool(executor=executor),
         ReadFileTool(path_policy=path_policy),
-        WriteFileTool(path_policy=path_policy),
-        EditFileTool(path_policy=path_policy),
+        WriteFileTool(path_policy=path_policy, checkpoint_manager=checkpoints),
+        EditFileTool(path_policy=path_policy, checkpoint_manager=checkpoints),
         GlobTool(path_policy=path_policy),
         GrepTool(path_policy=path_policy),
         TodoWriteTool(),
         AgentTool(),
         AgentStatusTool(),
+        AgentResumeTool(),
         MemoryUpdateTool(),
         FetchUrlTool(),
         NowTool(),

@@ -1,5 +1,6 @@
 """Effect-aware scheduling: parallel reads, exclusive stateful calls."""
 
+import concurrent.futures
 import io
 import threading
 import time
@@ -11,6 +12,7 @@ from corecoder.agent import Agent
 from corecoder.cli import _ToolProgressDisplay
 from corecoder.demo import ScriptedLLM
 from corecoder.llm import LLMResponse, ToolCall
+from corecoder.resources import ResourceClaim, ResourceLockManager
 from corecoder.tools import build_tools
 from corecoder.tools.base import Tool, ToolEffect
 
@@ -64,6 +66,15 @@ class _UnknownTool(_TrackedTool):
     name = "unknown_effect"
 
 
+class _ResourceWriteTool(_TrackedTool):
+    name = "resource_write"
+    effect = ToolEffect.WRITE
+    resource_parallel = True
+
+    def resource_claims(self, arguments: dict) -> tuple[ResourceClaim, ...]:
+        return (ResourceClaim(f"file:{arguments['label']}", "write"),)
+
+
 def _run_batch(tools, calls):
     agent = Agent(
         llm=ScriptedLLM([
@@ -108,6 +119,43 @@ def test_unknown_effect_fails_closed_to_serial_execution():
     ])
 
     assert tool.effect == ToolEffect.UNKNOWN
+    assert tool.max_active == 1
+
+
+def test_resource_writes_to_different_targets_overlap():
+    tool = _ResourceWriteTool()
+    _run_batch([tool], [
+        _call("c1", tool.name, "one"),
+        _call("c2", tool.name, "two"),
+    ])
+
+    assert tool.max_active == 2
+
+
+def test_resource_writes_to_same_target_remain_serial():
+    tool = _ResourceWriteTool()
+    _run_batch([tool], [
+        _call("c1", tool.name, "same"),
+        _call("c2", tool.name, "same"),
+    ])
+
+    assert tool.max_active == 1
+
+
+def test_shared_resource_manager_serializes_parent_and_child_agents():
+    tool = _ResourceWriteTool()
+    locks = ResourceLockManager()
+    first = Agent(llm=ScriptedLLM([]), tools=[tool], resource_locks=locks)
+    second = Agent(llm=ScriptedLLM([]), tools=[tool], resource_locks=locks)
+    call_one = _call("c1", tool.name, "same")
+    call_two = _call("c2", tool.name, "same")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        one = pool.submit(first._exec_tool, call_one)
+        two = pool.submit(second._exec_tool, call_two)
+        assert one.result() == "same"
+        assert two.result() == "same"
+
     assert tool.max_active == 1
 
 
@@ -170,6 +218,7 @@ def test_builtin_tools_declare_conservative_effects():
     assert effects["bash"] == ToolEffect.EXTERNAL
     assert effects["fetch_url"] == ToolEffect.EXTERNAL
     assert effects["agent"] == ToolEffect.EXTERNAL
+    assert effects["agent_resume"] == ToolEffect.EXTERNAL
 
 
 def test_progress_events_identify_a_real_parallel_batch():

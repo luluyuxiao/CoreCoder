@@ -38,6 +38,19 @@ def test_read_only_tools_run_without_consent(tmp_path):
     assert "hello" in agent.messages[2]["content"]
 
 
+def test_permission_exposes_one_structured_decision_contract():
+    allowed = Permission().decide("read_file", {"file_path": "README.md"})
+    denied = Permission().decide("write_file", {"file_path": "x"})
+
+    assert (allowed.gate, allowed.code, allowed.allowed, allowed.result) == (
+        "permission", "read_only", True, None,
+    )
+    assert denied.gate == "permission"
+    assert denied.code == "non_interactive_deny"
+    assert denied.allowed is False
+    assert "Permission denied" in denied.reason
+
+
 def test_allow_once_asks_again_for_the_next_call(tmp_path):
     asked = []
     agent = Agent(

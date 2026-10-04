@@ -423,6 +423,16 @@ def _positive_float(value: str) -> float:
     return number
 
 
+def _provider_route(value: str) -> dict:
+    try:
+        route = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"route must be JSON: {error}") from error
+    if not isinstance(route, dict) or not route.get("model"):
+        raise argparse.ArgumentTypeError("route must be a JSON object with model")
+    return route
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(prog="corecoder-eval", description="Run repeatable CoreCoder eval cases")
     parser.add_argument("manifest", help="JSON manifest containing eval cases")
@@ -441,6 +451,13 @@ def _parse_args():
         dest="fallback_models",
         help="Fallback model; repeat for an ordered chain",
     )
+    parser.add_argument(
+        "--fallback-route",
+        action="append",
+        type=_provider_route,
+        dest="fallback_routes",
+        metavar="JSON",
+    )
     parser.add_argument("--max-cost", type=_positive_float, dest="max_cost_usd")
     parser.add_argument("--base-url")
     parser.add_argument("--api-key")
@@ -458,6 +475,8 @@ def main() -> int:
             config.model = args.model
         if args.fallback_models:
             config.fallback_models = args.fallback_models
+        if args.fallback_routes:
+            config.fallback_routes = args.fallback_routes
         if args.max_cost_usd is not None:
             config.max_cost_usd = args.max_cost_usd
         if args.base_url:
@@ -479,6 +498,7 @@ def main() -> int:
                 api_key=config.api_key,
                 base_url=config.base_url,
                 fallback_models=config.fallback_models,
+                fallback_routes=config.fallback_routes,
                 max_cost_usd=config.max_cost_usd,
                 temperature=config.temperature,
                 max_tokens=config.max_tokens,
@@ -522,6 +542,13 @@ def main() -> int:
             ).hexdigest(),
             "model": config.model,
             "fallback_models": config.fallback_models,
+            "fallback_routes": [
+                {
+                    key: value for key, value in route.items()
+                    if key not in {"api_key"}
+                }
+                for route in config.fallback_routes
+            ],
             "provider": config.provider,
             "base_url": config.base_url,
             "sandbox": config.sandbox,

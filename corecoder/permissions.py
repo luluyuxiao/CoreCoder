@@ -16,6 +16,8 @@ the loop survives and the model can route around it.
 
 import threading
 
+from .decisions import ToolDecision
+
 
 class Permission:
     """Session-scoped consent state. Pure: no I/O, the CLI hands in `ask`."""
@@ -53,39 +55,37 @@ class Permission:
     def check(self, tool_name: str, arguments: dict) -> str | None:
         """Decide one call. None lets it through; a string is the refusal
         the model receives as its tool result."""
-        return self.decide(tool_name, arguments)[1]
+        return self.decide(tool_name, arguments).result
 
-    def decide(self, tool_name: str, arguments: dict) -> tuple[str, str | None]:
+    def decide(self, tool_name: str, arguments: dict) -> ToolDecision:
         """Return a traceable decision label and the optional refusal text."""
         with self._lock:
             if tool_name in self.READ_ONLY:
-                return "read_only", None
+                return ToolDecision.allow("permission", "read_only")
             if self.allow_all:
-                return "allow_all", None
+                return ToolDecision.allow("permission", "allow_all")
             if tool_name in self._always:
-                return "always_cached", None
+                return ToolDecision.allow("permission", "always_cached")
         if self.ask is None:
-            return (
+            return ToolDecision.deny(
+                "permission",
                 "non_interactive_deny",
-                (
-                    f"Permission denied: {tool_name} mutates state and this session is "
-                    "non-interactive, so nobody can approve it. Rerun with --yes, or "
-                    "tell the user the exact step so they can run it themselves."
-                ),
+                f"Permission denied: {tool_name} mutates state and this session is "
+                "non-interactive, so nobody can approve it. Rerun with --yes, or "
+                "tell the user the exact step so they can run it themselves.",
             )
         verdict = self.ask(tool_name, arguments)
         if verdict == "always":
             with self._lock:
                 self._always.add(tool_name)
-            return "always", None
+            return ToolDecision.allow("permission", "always")
         if verdict == "once":
-            return "once", None
-        return (
+            return ToolDecision.allow("permission", "once")
+        return ToolDecision.deny(
+            "permission",
             "deny",
-            (
-                f"Permission denied: the user refused this {tool_name} call. "
-                "Do not retry it unchanged; ask what they would prefer instead."
-            ),
+            f"Permission denied: the user refused this {tool_name} call. "
+            "Do not retry it unchanged; ask what they would prefer instead.",
         )
 
 
@@ -96,16 +96,15 @@ class _BackgroundPermission:
         self.parent = parent
 
     def check(self, tool_name: str, arguments: dict) -> str | None:
-        return self.decide(tool_name, arguments)[1]
+        return self.decide(tool_name, arguments).result
 
-    def decide(self, tool_name: str, arguments: dict) -> tuple[str, str | None]:
+    def decide(self, tool_name: str, arguments: dict) -> ToolDecision:
         if self.parent.is_preapproved(tool_name):
-            return "background_preapproved", None
-        return (
+            return ToolDecision.allow("permission", "background_preapproved")
+        return ToolDecision.deny(
+            "permission",
             "background_deny",
-            (
-                f"Permission denied: background sub-agent cannot prompt for {tool_name}. "
-                "Pre-approve this tool with 'always allow' before launching, use --yes, "
-                "or run the sub-agent in foreground mode."
-            ),
+            f"Permission denied: background sub-agent cannot prompt for {tool_name}. "
+            "Pre-approve this tool with 'always allow' before launching, use --yes, "
+            "or run the sub-agent in foreground mode.",
         )

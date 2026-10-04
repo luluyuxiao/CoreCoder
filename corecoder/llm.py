@@ -11,9 +11,10 @@ single unified interface. Set CORECODER_PROVIDER=litellm.
 
 import json
 import logging
+import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import chain
 
 from openai import APIConnectionError, APIError, APITimeoutError, BadRequestError, OpenAI, RateLimitError
@@ -53,6 +54,91 @@ class LLMResponse:
                 for tc in self.tool_calls
             ]
         return msg
+
+
+@dataclass(frozen=True)
+class ProviderRoute:
+    """One independently configured model/provider fallback destination."""
+
+    model: str
+    provider: str = "openai"
+    name: str = ""
+    base_url: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    input_price: float | None = None
+    output_price: float | None = None
+
+    def __post_init__(self):
+        if not self.model.strip():
+            raise ValueError("provider route model must not be empty")
+        if self.provider not in {"openai", "litellm"}:
+            raise ValueError("provider route provider must be 'openai' or 'litellm'")
+        supplied = self.input_price is not None or self.output_price is not None
+        if supplied and (self.input_price is None or self.output_price is None):
+            raise ValueError("provider route pricing requires both input_price and output_price")
+        if self.input_price is not None and (self.input_price < 0 or self.output_price < 0):
+            raise ValueError("provider route pricing must not be negative")
+
+    @property
+    def route_id(self) -> str:
+        return self.name or f"{self.provider}:{self.model}@{self.base_url or 'default'}"
+
+    def pricing(self) -> tuple[float, float] | None:
+        if self.input_price is not None and self.output_price is not None:
+            return self.input_price, self.output_price
+        return _pricing_for_model(self.model)
+
+    def public_dict(self) -> dict:
+        """Return trace/session-safe metadata with credentials removed."""
+        return {
+            "name": self.name,
+            "provider": self.provider,
+            "model": self.model,
+            "base_url": self.base_url,
+            "input_price": self.input_price,
+            "output_price": self.output_price,
+        }
+
+    @classmethod
+    def from_value(
+        cls,
+        value: "ProviderRoute | dict",
+        *,
+        default_provider: str,
+        default_api_key: str | None,
+        default_base_url: str | None,
+    ) -> "ProviderRoute":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            raise TypeError("fallback route must be a ProviderRoute or object")
+        provider = str(value.get("provider") or default_provider).lower()
+        api_key_env = value.get("api_key_env")
+        if api_key_env is not None and not isinstance(api_key_env, str):
+            raise TypeError("provider route api_key_env must be a string")
+        api_key = value.get("api_key")
+        if api_key is None and api_key_env:
+            api_key = os.getenv(api_key_env)
+        if api_key is None and provider == default_provider:
+            api_key = default_api_key
+        base_url = value.get("base_url")
+        if base_url is None and provider == default_provider:
+            base_url = default_base_url
+        return cls(
+            name=str(value.get("name") or ""),
+            provider=provider,
+            model=str(value.get("model") or ""),
+            base_url=str(base_url) if base_url else None,
+            api_key=str(api_key) if api_key else None,
+            input_price=(
+                float(value["input_price"])
+                if value.get("input_price") is not None else None
+            ),
+            output_price=(
+                float(value["output_price"])
+                if value.get("output_price") is not None else None
+            ),
+        )
 
 
 # pricing per million tokens: (input, output)
@@ -137,11 +223,23 @@ class LLM:
         api_key: str,
         base_url: str | None = None,
         fallback_models: list[str] | tuple[str, ...] | None = None,
+        fallback_routes: list[ProviderRoute | dict] | tuple[ProviderRoute | dict, ...] | None = None,
         max_cost_usd: float | None = None,
         **kwargs,
     ):
-        self._init_policy(model, fallback_models, max_cost_usd)
+        self._init_policy(
+            model,
+            fallback_models,
+            max_cost_usd,
+            provider="openai",
+            api_key=api_key,
+            base_url=base_url,
+            fallback_routes=fallback_routes,
+        )
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self._openai_clients = {
+            (api_key or "", base_url or ""): self.client,
+        }
         self.extra = kwargs  # temperature, max_tokens, etc.
 
     def _init_policy(
@@ -149,6 +247,11 @@ class LLM:
         model: str,
         fallback_models: list[str] | tuple[str, ...] | None,
         max_cost_usd: float | None,
+        *,
+        provider: str,
+        api_key: str | None,
+        base_url: str | None,
+        fallback_routes: list[ProviderRoute | dict] | tuple[ProviderRoute | dict, ...] | None,
     ):
         if max_cost_usd is not None and max_cost_usd <= 0:
             raise ValueError("max_cost_usd must be greater than zero")
@@ -158,10 +261,51 @@ class LLM:
             for candidate in dict.fromkeys(fallback_models or [])
             if candidate and candidate != model
         ]
+        primary = ProviderRoute(
+            name="primary",
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+        )
+        explicit = [
+            ProviderRoute.from_value(
+                route,
+                default_provider=provider,
+                default_api_key=api_key,
+                default_base_url=base_url,
+            )
+            for route in (fallback_routes or [])
+        ]
+        legacy = [
+            ProviderRoute(
+                name=f"fallback-{index + 1}",
+                provider=provider,
+                model=candidate,
+                base_url=base_url,
+                api_key=api_key,
+            )
+            for index, candidate in enumerate(self.fallback_models)
+        ]
+        seen = {primary.route_id}
+        routes = [primary]
+        for route in [*explicit, *legacy]:
+            if route.route_id not in seen and not (
+                route.model == primary.model
+                and route.provider == primary.provider
+                and route.base_url == primary.base_url
+                and route.api_key == primary.api_key
+            ):
+                routes.append(route)
+                seen.add(route.route_id)
+        self.routes = routes
+        self.fallback_routes = routes[1:]
+        self._active_route = primary
         self.max_cost_usd = max_cost_usd
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.usage_by_model: dict[str, dict[str, int]] = {}
+        self.usage_by_route: dict[str, dict] = {}
         self.fallback_history: list[tuple[str, str, str]] = []
         self._budget_usage_missing = False
         self._event_local = threading.local()
@@ -169,6 +313,23 @@ class LLM:
     @property
     def estimated_cost(self) -> float | None:
         """Rough cumulative USD cost, including every model used by fallback."""
+        route_usage = getattr(self, "usage_by_route", None)
+        if route_usage:
+            total = 0.0
+            routes = {route.route_id: route for route in self.routes}
+            for route_id, tokens in route_usage.items():
+                route = routes.get(route_id)
+                pricing = route.pricing() if route is not None else None
+                if pricing is None and tokens.get("input_price") is not None:
+                    pricing = (tokens["input_price"], tokens["output_price"])
+                if pricing is None:
+                    return None
+                input_rate, output_rate = pricing
+                total += (
+                    tokens["prompt"] * input_rate / 1_000_000
+                    + tokens["completion"] * output_rate / 1_000_000
+                )
+            return total
         usage = getattr(self, "usage_by_model", None)
         if usage:
             total = 0.0
@@ -241,24 +402,29 @@ class LLM:
         # an unrecognized 400 re-raises instead of doubling _call_with_retry's
         # exhausted retries. LiteLLM never lands here: drop_params strips
         # unsupported keys on that path.
-        candidates = list(dict.fromkeys([self.model, *self.fallback_models]))
+        candidates = self._candidate_routes()
         starting_model = self.model
+        starting_route = candidates[0]
         last_fallback_error: Exception | None = None
         response_model = self.model
-        for position, candidate in enumerate(candidates):
+        response_route = starting_route
+        for position, route in enumerate(candidates):
+            candidate = route.model
             params = {**base_params, "model": candidate}
             params["stream_options"] = {"include_usage": True}
-            self._apply_budget_limit(params, candidate)
+            self._apply_budget_limit(params, route)
             try:
                 while True:
                     try:
-                        stream = self._call_with_retry(params)
+                        stream = self._call_route(params, route)
                         break
                     except BadRequestError as e:
                         if _adapt_rejected_param(params, e):
                             self._emit_event(
                                 "llm.provider_adapted",
                                 model=candidate,
+                                provider=route.provider,
+                                route=route.route_id,
                                 reason="rejected_parameter",
                             )
                             continue
@@ -273,6 +439,8 @@ class LLM:
                         self._emit_event(
                             "llm.provider_adapted",
                             model=candidate,
+                            provider=route.provider,
+                            route=route.route_id,
                             reason="stream_options_removed",
                         )
                 # Stream creation can succeed and the iterator can still fail
@@ -287,9 +455,14 @@ class LLM:
                     stream = chain((first_chunk,), iterator)
             except Exception as e:
                 has_fallback = position < len(candidates) - 1
-                if not has_fallback or not self._is_fallback_error(e):
+                retryable = (
+                    self._is_litellm_transient(e)
+                    if route.provider == "litellm" else self._is_fallback_error(e)
+                )
+                if not has_fallback or not retryable:
                     raise
-                next_model = candidates[position + 1]
+                next_route = candidates[position + 1]
+                next_model = next_route.model
                 log.warning(
                     "model %r unavailable after retries (%s); trying fallback %r",
                     candidate,
@@ -301,17 +474,24 @@ class LLM:
                     "llm.fallback",
                     from_model=candidate,
                     to_model=next_model,
+                    from_route=route.route_id,
+                    to_route=next_route.route_id,
+                    from_provider=route.provider,
+                    to_provider=next_route.provider,
                     error_type=type(e).__name__,
                     status_code=getattr(e, "status_code", None),
                 )
                 continue
 
             response_model = candidate
-            if candidate != starting_model:
-                self.model = candidate  # sticky: do not retry a dead primary every round
+            response_route = route
+            if route.route_id != starting_route.route_id:
+                self._activate_route(route)  # sticky: skip a dead primary next round
                 self.fallback_history.append(
                     (starting_model, candidate, str(last_fallback_error or "unavailable"))
                 )
+            else:
+                self._activate_route(route)
             break
 
         content_parts: list[str] = []
@@ -370,6 +550,25 @@ class LLM:
         )
         usage["prompt"] += prompt_tok
         usage["completion"] += completion_tok
+        route_usage = self.usage_by_route.setdefault(
+            response_route.route_id,
+            {
+                "prompt": 0,
+                "completion": 0,
+                "model": response_route.model,
+                "provider": response_route.provider,
+                "input_price": (
+                    response_route.pricing()[0]
+                    if response_route.pricing() is not None else None
+                ),
+                "output_price": (
+                    response_route.pricing()[1]
+                    if response_route.pricing() is not None else None
+                ),
+            },
+        )
+        route_usage["prompt"] += prompt_tok
+        route_usage["completion"] += completion_tok
 
         if self.max_cost_usd is not None:
             if prompt_tok + completion_tok == 0:
@@ -402,17 +601,121 @@ class LLM:
         except Exception as e:  # noqa: BLE001
             log.warning("LLM event callback failed for %s: %s", event, e)
 
-    def _apply_budget_limit(self, params: dict, model: str):
+    def _candidate_routes(self) -> list[ProviderRoute]:
+        active = self._active_route
+        if self.model != active.model:
+            active = replace(active, model=self.model, name="manual")
+        matching = next(
+            (
+                index for index, route in enumerate(self.routes)
+                if route.route_id == active.route_id
+            ),
+            None,
+        )
+        if matching is None:
+            return [active, *[
+                route for route in self.fallback_routes
+                if route.model != active.model or route.provider != active.provider
+            ]]
+        return self.routes[matching:]
+
+    def _activate_route(self, route: ProviderRoute):
+        previous = self._active_route
+        self._active_route = route
+        self.model = route.model
+        if route.provider == "openai":
+            if not (
+                previous.provider == "openai"
+                and previous.api_key == route.api_key
+                and previous.base_url == route.base_url
+            ):
+                self.client = self._openai_client(route)
+        else:
+            self.api_key = route.api_key
+            self.base_url = route.base_url
+
+    @property
+    def active_route(self) -> ProviderRoute:
+        return self._active_route
+
+    def _openai_client(self, route: ProviderRoute):
+        clients = getattr(self, "_openai_clients", None)
+        if clients is None:
+            clients = {}
+            self._openai_clients = clients
+        key = (route.api_key or "", route.base_url or "")
+        client = clients.get(key)
+        if client is None:
+            client = OpenAI(api_key=route.api_key or "not-set", base_url=route.base_url)
+            clients[key] = client
+        return client
+
+    def _call_route(self, params: dict, route: ProviderRoute):
+        if route.provider == "litellm":
+            return self._call_litellm_route_with_retry(params, route)
+        active = self._active_route
+        if not (
+            active.provider == "openai"
+            and active.api_key == route.api_key
+            and active.base_url == route.base_url
+        ):
+            self.client = self._openai_client(route)
+        return self._call_with_retry(params)
+
+    def _call_litellm_route_with_retry(
+        self,
+        params: dict,
+        route: ProviderRoute,
+        max_retries: int = 3,
+    ):
+        import litellm
+
+        params["drop_params"] = True
+        if route.api_key:
+            params["api_key"] = route.api_key
+        if route.base_url:
+            params["api_base"] = route.base_url
+        for attempt in range(max_retries):
+            try:
+                return litellm.completion(**params)
+            except Exception as error:
+                if not self._is_litellm_transient(error) or attempt == max_retries - 1:
+                    raise
+                wait = 2 ** attempt
+                self._emit_event(
+                    "llm.retry",
+                    attempt=attempt + 1,
+                    wait_seconds=wait,
+                    error_type=type(error).__name__,
+                    model=params.get("model"),
+                    provider=route.provider,
+                    route=route.route_id,
+                )
+                time.sleep(wait)
+
+    @staticmethod
+    def _is_litellm_transient(error: Exception) -> bool:
+        text = str(error).lower()
+        return any(
+            marker in text for marker in (
+                "rate_limit", "rate limit", "timeout", "connection",
+                "internal server", "overloaded", "500", "502", "503", "504", "529",
+            )
+        )
+
+    def _apply_budget_limit(self, params: dict, model: ProviderRoute | str):
         """Reserve input cost and clamp output tokens to the remaining USD."""
         if self.max_cost_usd is None:
             return
         if self._budget_usage_missing:
             raise BudgetExceededError("token usage is unavailable; refusing more spend")
 
-        pricing = _pricing_for_model(model)
+        route = model if isinstance(model, ProviderRoute) else None
+        model_name = route.model if route is not None else model
+        pricing = route.pricing() if route is not None else _pricing_for_model(model_name)
         if pricing is None:
             raise BudgetExceededError(
-                f"no pricing is configured for model {model!r}; refusing an unmetered request"
+                f"no pricing is configured for model {model_name!r}; refusing an unmetered request"
             )
         spent = self.estimated_cost
         if spent is None:
@@ -502,36 +805,37 @@ class LiteLLM(LLM):
         api_key: str | None = None,
         base_url: str | None = None,
         fallback_models: list[str] | tuple[str, ...] | None = None,
+        fallback_routes: list[ProviderRoute | dict] | tuple[ProviderRoute | dict, ...] | None = None,
         max_cost_usd: float | None = None,
         **kwargs,
     ):
         # skip LLM.__init__ which creates an OpenAI client
-        self._init_policy(model, fallback_models, max_cost_usd)
+        self._init_policy(
+            model,
+            fallback_models,
+            max_cost_usd,
+            provider="litellm",
+            api_key=api_key,
+            base_url=base_url,
+            fallback_routes=fallback_routes,
+        )
         self.api_key = api_key
         self.base_url = base_url
         self.extra = kwargs
+
+    def _call_route(self, params: dict, route: ProviderRoute):
+        if route.provider == "openai":
+            self.client = self._openai_client(route)
+            return LLM._call_with_retry(self, params)
+        self.api_key = route.api_key
+        self.base_url = route.base_url
+        return self._call_with_retry(params)
 
     @staticmethod
     def _is_fallback_error(exc: Exception) -> bool:
         if LLM._is_fallback_error(exc):
             return True
-        message = str(exc).lower()
-        return any(
-            marker in message
-            for marker in (
-                "rate_limit",
-                "rate limit",
-                "timeout",
-                "connection",
-                "internal server",
-                "overloaded",
-                "500",
-                "502",
-                "503",
-                "504",
-                "529",
-            )
-        )
+        return LLM._is_litellm_transient(exc)
 
     def _call_with_retry(self, params: dict, max_retries: int = 3):
         """Retry on transient errors with exponential backoff via litellm."""

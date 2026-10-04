@@ -13,6 +13,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from .decisions import ToolDecision
+
 FILESYSTEM_READ = "filesystem_read"
 FILESYSTEM_WRITE = "filesystem_write"
 NETWORK = "network"
@@ -103,24 +105,35 @@ class CapabilityPolicy:
             return max(matches, key=lambda rule: len(rule.pattern)).allowed
         return None if self.default == "allow" else frozenset()
 
-    def decide(self, tool, arguments: dict) -> tuple[str, str | None]:
+    def decide(self, tool, arguments: dict) -> ToolDecision:
         required = frozenset(tool.required_capabilities(arguments))
         invalid = required - KNOWN_CAPABILITIES
         if invalid:
             required = required | {UNKNOWN}
         allowed = self._allowed_for(tool.name)
         if allowed is None:
-            return "capability_allow_all", None
+            return ToolDecision.allow(
+                "capability",
+                "capability_allow_all",
+                required=sorted(required),
+            )
         denied = required - allowed
         if not denied:
-            return "capability_allow", None
-        return (
+            return ToolDecision.allow(
+                "capability",
+                "capability_allow",
+                required=sorted(required),
+                allowed=sorted(allowed),
+            )
+        return ToolDecision.deny(
+            "capability",
             "capability_deny",
-            (
-                f"Capability denied: tool {tool.name!r} requires "
-                f"{', '.join(sorted(denied))}, which is not allowed by the active "
-                "per-tool capability policy. Do not retry unchanged."
-            ),
+            f"Capability denied: tool {tool.name!r} requires "
+            f"{', '.join(sorted(denied))}, which is not allowed by the active "
+            "per-tool capability policy. Do not retry unchanged.",
+            required=sorted(required),
+            allowed=sorted(allowed),
+            denied=sorted(denied),
         )
 
     def as_dict(self) -> dict:
