@@ -1,0 +1,56 @@
+{
+  "default": "deepseek-fast",
+  "models": {
+    "deepseek-fast": {
+      "description": "Cost-efficient daily coding with Pro as a transport fallback",
+      "provider": "openai",
+      "model": "deepseek-flash",
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "max_tokens": 8192,
+      "fallback_routes": [
+        {
+          "name": "deepseek-pro-fallback",
+          "provider": "openai",
+          "model": "deepseek-v4-pro",
+          "base_url": "https://api.deepseek.com",
+          "api_key_env": "DEEPSEEK_API_KEY"
+        }
+      ]
+    },
+    "deepseek-pro": {
+      "description": "Higher-quality model for difficult reasoning and large refactors",
+      "provider": "openai",
+      "model": "deepseek-v4-pro",
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "max_tokens": 16384,
+      "fallback_routes": [
+        {
+          "name": "deepseek-flash-fallback",
+          "provider": "openai",
+          "model": "deepseek-flash",
+          "base_url": "https://api.deepseek.com",
+          "api_key_env": "DEEPSEEK_API_KEY"
+        }
+      ]
+    },
+    "deepseek-long": {
+      "description": "Long reviews and reports with a larger output allowance",
+      "provider": "openai",
+      "model": "deepseek-v4-pro",
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "max_tokens": 32768,
+      "fallback_routes": [
+        {
+          "name": "deepseek-flash-fallback",
+          "provider": "openai",
+          "model": "deepseek-flash",
+          "base_url": "https://api.deepseek.com",
+          "api_key_env": "DEEPSEEK_API_KEY"
+        }
+      ]
+    }
+  }
+}
