@@ -107,6 +107,7 @@ def test_config_defaults(monkeypatch):
     monkeypatch.delenv("CORECODER_TRACE_CONTENT", raising=False)
     monkeypatch.delenv("CORECODER_STORAGE_PATH", raising=False)
     monkeypatch.delenv("CORECODER_AUTOSAVE", raising=False)
+    monkeypatch.delenv("CORECODER_TOOL_RETRIEVAL_LIMIT", raising=False)
 
     c = Config.from_env()
     assert c.model == "gpt-5.5"
@@ -118,6 +119,7 @@ def test_config_defaults(monkeypatch):
     assert c.trace_content is False
     assert c.storage_path is None
     assert c.autosave is True
+    assert c.tool_retrieval_limit == 5
 
 
 def test_config_reads_trace_settings(monkeypatch, tmp_path):

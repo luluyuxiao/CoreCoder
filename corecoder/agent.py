@@ -27,6 +27,7 @@ from .memory import MemoryState
 from .permissions import Permission
 from .prompt import PLAN_MODE_PROMPT, system_prompt
 from .resources import ResourceClaim, ResourceLockManager
+from .tool_catalog import ToolCatalog, default_tool_schema_budget
 from .tools import build_tools
 from .tools.agent import AgentResumeTool, AgentStatusTool, AgentTool
 from .tools.base import Tool
@@ -36,6 +37,21 @@ from .tools.todo import TodoWriteTool
 from .trace import NULL_TRACE, TraceSink
 
 log = logging.getLogger(__name__)
+
+
+def _llm_supports_events(llm) -> bool:
+    """Whether this LLM implementation accepts the optional trace callback."""
+    try:
+        signature = inspect.signature(llm.chat)
+        return (
+            "on_event" in signature.parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 class Agent:
@@ -57,6 +73,8 @@ class Agent:
         capability_policy: CapabilityPolicy | None = None,
         memory_state: MemoryState | None = None,
         resource_locks: ResourceLockManager | None = None,
+        tool_schema_budget_tokens: int | None = None,
+        tool_retrieval_limit: int = 5,
     ):
         self.llm = llm
         self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
@@ -77,6 +95,10 @@ class Agent:
         self._pending_context_summaries: list[dict] = []
         self._active_run_id: str | None = None
         self._active_round: int | None = None
+        # A profile is CLI metadata rather than an LLM credential.  Keeping its
+        # name lets a resumed interactive session select the same non-secret
+        # provider preset before restoring model state.
+        self.model_profile: str | None = None
         self.memory = (
             MemoryState.from_dict(memory_state.to_dict())
             if memory_state is not None else MemoryState()
@@ -86,11 +108,26 @@ class Agent:
         # still overlap in background mode.
         self._llm_lock = llm_lock or threading.RLock()
         self._resource_locks = resource_locks or ResourceLockManager()
-        self.tools = tools if tools is not None else build_tools()
+        self.tools = list(tools) if tools is not None else build_tools()
         self.permission = permission
         self.hooks = hooks
         self.capability_policy = capability_policy or CapabilityPolicy()
-        self._tool_by_name = {t.name: t for t in self.tools}
+        schema_budget = (
+            tool_schema_budget_tokens
+            if tool_schema_budget_tokens is not None
+            else default_tool_schema_budget(max_context_tokens)
+        )
+        self.tool_catalog = ToolCatalog(self.tools, schema_budget)
+        if tool_retrieval_limit < 0:
+            raise ValueError("tool_retrieval_limit must not be negative")
+        self.tool_retrieval_limit = min(20, int(tool_retrieval_limit))
+        self._tool_by_name = {
+            tool.name: tool
+            for tool in [
+                *self.tools,
+                *(self.tool_catalog.discovery_tools if self.tool_catalog.enabled else ()),
+            ]
+        }
         self._skill_loader = next(
             (t for t in self.tools if isinstance(t, LoadSkillTool)), None
         )
@@ -105,19 +142,9 @@ class Agent:
         # one successful LLM request has actually consumed it.
         self._unconsumed_tool_call_ids: set[str] = set()
         self.max_rounds = max_rounds
-        self._system = system_prompt(self.tools, cwd=self.workspace)
+        self._system = system_prompt(self.tool_catalog.schema_tools(), cwd=self.workspace)
         self.plan_mode = False  # toggled by /plan; while on, mutating tools are refused
-        try:
-            llm_signature = inspect.signature(self.llm.chat)
-            self._llm_accepts_events = (
-                "on_event" in llm_signature.parameters
-                or any(
-                    parameter.kind == inspect.Parameter.VAR_KEYWORD
-                    for parameter in llm_signature.parameters.values()
-                )
-            )
-        except (TypeError, ValueError):
-            self._llm_accepts_events = False
+        self._llm_accepts_events = _llm_supports_events(self.llm)
 
         # wire up sub-agent capability
         for t in self.tools:
@@ -129,6 +156,8 @@ class Agent:
             # The lock is cheap and custom tools may require real arguments to
             # compute their scheduling group.
             t.execution_lock()
+        for t in self.tool_catalog.discovery_tools:
+            t.execution_lock()
 
         self._todo = next((t for t in self.tools if isinstance(t, TodoWriteTool)), None)
         checkpoint_managers = [
@@ -139,6 +168,17 @@ class Agent:
         ]
         self.checkpoints = checkpoint_managers[0] if checkpoint_managers else CheckpointManager()
 
+    def replace_llm(self, llm: LLM):
+        """Swap the active provider atomically between REPL turns.
+
+        Provider presets can change not only a model name but the SDK backend,
+        endpoint and credential.  Serializing with active LLM calls prevents a
+        background sub-agent from observing a half-replaced client.
+        """
+        with self._llm_lock:
+            self.llm = llm
+            self._llm_accepts_events = _llm_supports_events(llm)
+
     def replace_tools(self, tools: list[Tool]):
         """Atomically rebuild the instance-level capability registry.
 
@@ -147,9 +187,10 @@ class Agent:
         same registry.
         """
         updated = list(tools)
-        by_name = {tool.name: tool for tool in updated}
-        if len(by_name) != len(updated):
-            raise ValueError("tool names must be unique")
+        # Validate names and the budgeted replacement before publishing the
+        # new execution list. A rejected refresh must leave the old registry
+        # usable rather than exposing a half-replaced Agent.
+        self.tool_catalog.replace(updated)
         for tool in updated:
             if isinstance(tool, (AgentTool, AgentStatusTool, AgentResumeTool)):
                 tool._parent_agent = self
@@ -157,7 +198,13 @@ class Agent:
                 tool.bind(self.memory)
             tool.execution_lock()
         self.tools = updated
-        self._tool_by_name = by_name
+        self._tool_by_name = {
+            tool.name: tool
+            for tool in [
+                *updated,
+                *(self.tool_catalog.discovery_tools if self.tool_catalog.enabled else ()),
+            ]
+        }
         self._skill_loader = next(
             (tool for tool in updated if isinstance(tool, LoadSkillTool)), None
         )
@@ -172,9 +219,19 @@ class Agent:
         ]
         if managers:
             self.checkpoints = managers[0]
-        self._system = system_prompt(self.tools, cwd=self.workspace)
+        self._refresh_system_prompt()
+
+    def _refresh_system_prompt(self):
+        """Describe only model-visible Tools, never the complete hidden catalog."""
+        self._system = system_prompt(
+            self.tool_catalog.schema_tools(),
+            cwd=self.workspace,
+        )
 
     def _full_messages(self) -> list[dict]:
+        # Tool activation and MCP refresh can change model-visible schemas
+        # between rounds. Keep the prose tool list in lockstep with schemas.
+        self._refresh_system_prompt()
         system = self._system
         # re-injected every round, like the task list below, so a toggle made
         # between turns takes effect on the very next request
@@ -244,7 +301,46 @@ class Agent:
         )
 
     def _tool_schemas(self) -> list[dict]:
-        return [t.schema() for t in self.tools]
+        return [tool.schema() for tool in self.tool_catalog.schema_tools()]
+
+    def _tool_retrieval_query(self, user_input: str) -> str:
+        """Build a compact task query without copying the conversation."""
+        parts = [str(user_input or "").strip()]
+        if self.memory.goal:
+            parts.append(f"Goal: {self.memory.goal}")
+        current_steps = [
+            str(item.get("content") or "").strip()
+            for item in self.memory.plan
+            if item.get("status") in {"pending", "in_progress"}
+        ]
+        if current_steps:
+            parts.append("Current plan: " + " ".join(current_steps[:3]))
+        return "\n".join(part for part in parts if part)[:4000]
+
+    def _retrieve_tools_for_task(self, user_input: str) -> dict | None:
+        """Preselect relevant schemas once per user turn, with manual fallback."""
+        if not self.tool_catalog.enabled or self.tool_retrieval_limit <= 0:
+            return None
+        query = self._tool_retrieval_query(user_input)
+        if not query:
+            return None
+        result = self.tool_catalog.retrieve(query, self.tool_retrieval_limit)
+        self._refresh_system_prompt()
+        self._trace(
+            "tool.catalog.retrieved",
+            query_chars=len(query),
+            requested_limit=self.tool_retrieval_limit,
+            matches=result["matches"],
+            candidates=result["candidates"],
+            activated=result["activated"],
+            deactivated=result["deactivated"],
+            rejected_over_budget=result["rejected_over_budget"],
+            retained_previous=result["retained_previous"],
+            active_schema_tokens=result["active_schema_tokens"],
+            schema_budget_tokens=result["schema_budget_tokens"],
+            **self._trace_content(retrieval_query=query),
+        )
+        return result
 
     def chat(
         self,
@@ -309,6 +405,7 @@ class Agent:
         on_tool=None,
         on_tool_progress=None,
     ) -> str:
+        self._retrieve_tools_for_task(user_input)
         self._append_message({"role": "user", "content": user_input})
         self.persist_state("running")
 
@@ -337,6 +434,12 @@ class Agent:
                     + self.context.safety_margin_tokens
                 ),
                 tool_schema_count=len(schemas),
+                tool_schema_tokens=self.tool_catalog.active_schema_tokens,
+                tool_catalog_count=len(self.tools),
+                hidden_tool_count=len(self.tool_catalog.hidden_names),
+                tool_schema_budget=self.tool_catalog.budget_tokens,
+                lazy_tool_discovery=self.tool_catalog.enabled,
+                auto_tool_retrieval_limit=self.tool_retrieval_limit,
             )
             try:
                 with self._llm_lock:
@@ -543,6 +646,7 @@ class Agent:
         """Return a storage-neutral, JSON-serializable session snapshot."""
         metadata = {
             "agent_id": self.agent_id,
+            "model_profile": self.model_profile,
             "plan_mode": self.plan_mode,
             "unconsumed_tool_call_ids": sorted(self._unconsumed_tool_call_ids),
             "usage_by_model": copy.deepcopy(
@@ -555,6 +659,10 @@ class Agent:
                 getattr(self.llm, "fallback_history", [])
             ),
             "active_skills": self.active_skill_states(),
+            "active_tool_names": (
+                self.tool_catalog.active_actual_names
+                if self.tool_catalog.enabled else []
+            ),
             "memory_state": self.memory.to_dict(),
             "checkpoints": self.checkpoints.snapshot(),
         }
@@ -598,6 +706,8 @@ class Agent:
             0, int(snapshot.get("completion_tokens") or 0)
         )
         metadata = dict(snapshot.get("metadata") or {})
+        saved_profile = metadata.get("model_profile")
+        self.model_profile = saved_profile if isinstance(saved_profile, str) else None
         if hasattr(self.llm, "usage_by_model"):
             self.llm.usage_by_model = copy.deepcopy(metadata.get("usage_by_model") or {})
         if hasattr(self.llm, "usage_by_route"):
@@ -640,6 +750,13 @@ class Agent:
             else {}
         )
         self._reconcile_active_skills()
+        raw_active_tools = metadata.get("active_tool_names")
+        if self.tool_catalog.enabled and isinstance(raw_active_tools, list):
+            self.tool_catalog.activate(
+                [name for name in raw_active_tools if isinstance(name, str)],
+                replace=True,
+            )
+            self._refresh_system_prompt()
         self._unconsumed_tool_call_ids = set(
             metadata.get("unconsumed_tool_call_ids") or []
         )
@@ -881,6 +998,24 @@ class Agent:
         )
 
     def _gate_tool(self, tc) -> ToolDecision:
+        if (
+            self.tool_catalog.get(tc.name) is not None
+            and not self.tool_catalog.is_active(tc.name)
+        ):
+            decision = ToolDecision.deny(
+                "catalog",
+                "tool_schema_inactive",
+                f"Tool {tc.name!r} is installed but its schema is not active. "
+                "Use search_tools, then activate_tools, and retry on the next round.",
+            )
+            self._trace(
+                "tool.blocked",
+                tool_call_id=tc.id,
+                tool_name=tc.name,
+                gate="catalog",
+                **self._trace_content(result=decision.reason),
+            )
+            return decision
         hook_started = time.perf_counter()
         decision = self._pre_hook_decision(tc)
         self._trace(
@@ -1043,6 +1178,15 @@ class Agent:
             )) else "success"
             if outcome == "success":
                 self._record_memory_effect(tc)
+            if tc.name == "activate_tools":
+                self._refresh_system_prompt()
+                self._trace(
+                    "tool.catalog.updated",
+                    active_tools=self.tool_catalog.active_actual_names,
+                    hidden_tool_count=len(self.tool_catalog.hidden_names),
+                    active_schema_tokens=self.tool_catalog.active_schema_tokens,
+                    schema_budget_tokens=self.tool_catalog.budget_tokens,
+                )
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
             self._trace(
                 "tool.completed",

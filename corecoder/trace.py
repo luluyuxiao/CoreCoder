@@ -20,6 +20,7 @@ _CONTENT_FIELDS = frozenset({
     "arguments",
     "messages_after",
     "messages_before",
+    "retrieval_query",
     "result",
     "task",
     "user_input",

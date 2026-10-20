@@ -122,9 +122,16 @@ def test_composite_trace_only_sends_content_to_opted_in_sinks():
     content = MemoryTrace(capture_content=True)
     trace = CompositeTrace(metadata, content)
 
-    trace.emit("example", result="secret", duration_ms=2)
+    trace.emit(
+        "example",
+        result="secret",
+        retrieval_query="private user task",
+        duration_ms=2,
+    )
     assert "result" not in metadata.events[0]
+    assert "retrieval_query" not in metadata.events[0]
     assert content.events[0]["result"] == "secret"
+    assert content.events[0]["retrieval_query"] == "private user task"
     assert metadata.events[0]["duration_ms"] == 2
 
 

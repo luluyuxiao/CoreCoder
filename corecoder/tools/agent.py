@@ -330,7 +330,15 @@ class AgentTool(Tool):
                 capability_policy=parent.capability_policy,
                 memory_state=child_memory,
                 resource_locks=parent._resource_locks,
+                tool_schema_budget_tokens=parent.tool_catalog.budget_tokens,
+                tool_retrieval_limit=parent.tool_retrieval_limit,
             )
+            if parent.tool_catalog.enabled and sub.tool_catalog.enabled:
+                sub.tool_catalog.activate(
+                    parent.tool_catalog.active_actual_names,
+                    replace=True,
+                )
+                sub._refresh_system_prompt()
             result = sub.chat(task)
         except Exception as e:
             if worktree:

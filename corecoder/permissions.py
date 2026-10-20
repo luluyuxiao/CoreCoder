@@ -1,7 +1,7 @@
 """User consent for tool calls, distilled from Claude Code's permissions.
 
-The tools split in two. Read-only ones (read_file, glob, grep, todo_write,
-now, agent_status, load_skill)
+The tools split in two. Read-only/in-process ones (read_file, glob, grep,
+todo_write, now, agent_status, load_skill, search_tools, activate_tools)
 run the moment the model asks; the mutating ones (edit_file, write_file,
 bash, and spawning a sub-agent) stop for a yes first. "Always allow" is
 remembered per tool for the rest of the session: per tool rather than per
@@ -24,7 +24,7 @@ class Permission:
 
     READ_ONLY = frozenset({
         "read_file", "glob", "grep", "todo_write", "now", "agent_status",
-        "load_skill", "memory_update",
+        "load_skill", "memory_update", "search_tools", "activate_tools",
     })
 
     def __init__(self, ask=None, allow_all: bool = False):

@@ -1,16 +1,16 @@
-name: Publish to PyPI
+name: Build release artifact
 
 on:
+  workflow_dispatch:
   release:
     types: [published]
 
 permissions:
-  id-token: write
+  contents: read
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
-    environment: pypi
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -25,5 +25,9 @@ jobs:
           python -m build
           python -m twine check dist/*
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Upload distributions
+        uses: actions/upload-artifact@v5
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error

@@ -158,6 +158,10 @@ _PRICING = {
     "gpt-4o": (2.5, 10),
     "gpt-4o-mini": (0.15, 0.6),
     # DeepSeek
+    # Conservative peak rates; off-peak billing may be lower.
+    "deepseek-flash": (0.3, 1.2),
+    "deepseek-v4-pro": (1.32, 3.96),
+    # Legacy names retained for old saved sessions and compatibility tests.
     "deepseek-chat": (0.27, 1.10),
     "deepseek-reasoner": (0.55, 2.19),
     # Anthropic Claude
@@ -225,6 +229,7 @@ class LLM:
         fallback_models: list[str] | tuple[str, ...] | None = None,
         fallback_routes: list[ProviderRoute | dict] | tuple[ProviderRoute | dict, ...] | None = None,
         max_cost_usd: float | None = None,
+        primary_route_name: str = "primary",
         **kwargs,
     ):
         self._init_policy(
@@ -235,6 +240,7 @@ class LLM:
             api_key=api_key,
             base_url=base_url,
             fallback_routes=fallback_routes,
+            primary_route_name=primary_route_name,
         )
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self._openai_clients = {
@@ -252,9 +258,12 @@ class LLM:
         api_key: str | None,
         base_url: str | None,
         fallback_routes: list[ProviderRoute | dict] | tuple[ProviderRoute | dict, ...] | None,
+        primary_route_name: str,
     ):
         if max_cost_usd is not None and max_cost_usd <= 0:
             raise ValueError("max_cost_usd must be greater than zero")
+        if not primary_route_name.strip():
+            raise ValueError("primary_route_name must not be empty")
         self.model = model
         self.fallback_models = [
             candidate
@@ -262,7 +271,7 @@ class LLM:
             if candidate and candidate != model
         ]
         primary = ProviderRoute(
-            name="primary",
+            name=primary_route_name,
             provider=provider,
             model=model,
             base_url=base_url,
@@ -319,9 +328,14 @@ class LLM:
             routes = {route.route_id: route for route in self.routes}
             for route_id, tokens in route_usage.items():
                 route = routes.get(route_id)
-                pricing = route.pricing() if route is not None else None
-                if pricing is None and tokens.get("input_price") is not None:
+                # Usage records carry the price that applied when the request
+                # happened.  Prefer it so an interactive model-profile switch
+                # cannot re-price previous turns under the new route.
+                pricing = None
+                if tokens.get("input_price") is not None:
                     pricing = (tokens["input_price"], tokens["output_price"])
+                if pricing is None and route is not None:
+                    pricing = route.pricing()
                 if pricing is None:
                     return None
                 input_rate, output_rate = pricing
@@ -604,7 +618,7 @@ class LLM:
     def _candidate_routes(self) -> list[ProviderRoute]:
         active = self._active_route
         if self.model != active.model:
-            active = replace(active, model=self.model, name="manual")
+            active = replace(active, model=self.model, name=f"manual:{self.model}")
         matching = next(
             (
                 index for index, route in enumerate(self.routes)
@@ -636,6 +650,15 @@ class LLM:
 
     @property
     def active_route(self) -> ProviderRoute:
+        # `/model raw-name` keeps a profile's connection but changes the model
+        # before the next request.  Expose that effective route to Session
+        # snapshots instead of persisting the stale profile model name.
+        if self.model != self._active_route.model:
+            return replace(
+                self._active_route,
+                model=self.model,
+                name=f"manual:{self.model}",
+            )
         return self._active_route
 
     def _openai_client(self, route: ProviderRoute):
@@ -807,6 +830,7 @@ class LiteLLM(LLM):
         fallback_models: list[str] | tuple[str, ...] | None = None,
         fallback_routes: list[ProviderRoute | dict] | tuple[ProviderRoute | dict, ...] | None = None,
         max_cost_usd: float | None = None,
+        primary_route_name: str = "primary",
         **kwargs,
     ):
         # skip LLM.__init__ which creates an OpenAI client
@@ -818,6 +842,7 @@ class LiteLLM(LLM):
             api_key=api_key,
             base_url=base_url,
             fallback_routes=fallback_routes,
+            primary_route_name=primary_route_name,
         )
         self.api_key = api_key
         self.base_url = base_url

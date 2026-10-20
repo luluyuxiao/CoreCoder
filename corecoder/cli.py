@@ -1,6 +1,7 @@
 """Interactive REPL - the user-facing terminal interface."""
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.shortcuts import radiolist_dialog
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape
@@ -27,7 +29,13 @@ from rich.progress import (
 from . import __version__
 from .agent import Agent
 from .capabilities import load_capability_policy
-from .config import Config
+from .config import (
+    Config,
+    ModelProfile,
+    ModelProfiles,
+    apply_model_profile,
+    load_model_profiles,
+)
 from .hooks import load_hooks
 from .llm import LLM, LiteLLM
 from .mcp import load_mcp_tools, refresh_mcp_tools
@@ -202,6 +210,20 @@ def _positive_float(value: str) -> float:
     return number
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return number
+
+
+def _nonnegative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return number
+
+
 def _provider_route(value: str) -> dict:
     try:
         route = json.loads(value)
@@ -214,12 +236,137 @@ def _provider_route(value: str) -> dict:
     return route
 
 
+def _profile_route_name(profile_name: str | None) -> str:
+    """Keep usage records from distinct interactive profiles distinguishable."""
+    return f"profile:{profile_name}" if profile_name else "primary"
+
+
+def _build_llm(config: Config, *, profile_name: str | None = None):
+    """Create the provider client selected by one complete runtime config."""
+    llm_cls = LiteLLM if config.provider == "litellm" else LLM
+    return llm_cls(
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+        fallback_models=config.fallback_models,
+        fallback_routes=config.fallback_routes,
+        max_cost_usd=config.max_cost_usd,
+        temperature=config.temperature,
+        max_tokens=config.max_tokens,
+        primary_route_name=_profile_route_name(profile_name),
+    )
+
+
+def _carry_llm_usage(previous, replacement) -> None:
+    """Retain one Session's accounting while changing its active provider.
+
+    Route usage includes the historical price captured at request time, so the
+    replacement's different endpoint or price cannot rewrite past spend.
+    """
+    for field in (
+        "total_prompt_tokens",
+        "total_completion_tokens",
+        "usage_by_model",
+        "usage_by_route",
+        "fallback_history",
+        "_budget_usage_missing",
+    ):
+        if hasattr(previous, field) and hasattr(replacement, field):
+            setattr(replacement, field, copy.deepcopy(getattr(previous, field)))
+
+
+def _switch_model_profile(
+    agent: Agent,
+    config: Config,
+    baseline_config: Config,
+    profile: ModelProfile,
+) -> Config:
+    """Atomically select one non-secret profile during an idle REPL turn."""
+    updated = apply_model_profile(config, profile, base=baseline_config)
+    replacement = _build_llm(updated, profile_name=profile.name)
+    _carry_llm_usage(agent.llm, replacement)
+    agent.replace_llm(replacement)
+    agent.model_profile = profile.name
+    return updated
+
+
+def _show_model_profiles(profiles: ModelProfiles, agent: Agent):
+    if not profiles.profiles:
+        source_hint = (
+            " Set CORECODER_MODEL_PROFILES or create ~/.corecoder/models.json."
+        )
+        console.print(f"[dim]No model profiles configured.{source_hint}[/dim]")
+        return
+    source = str(profiles.source) if profiles.source else "configured source"
+    console.print(f"[bold]Model profiles:[/] [dim]{escape(source)}[/dim]")
+    for name in profiles.names():
+        profile = profiles.require(name)
+        active = name == agent.model_profile
+        marker = " [green](active)[/]" if active else ""
+        default = " [dim](default)[/]" if name == profiles.default else ""
+        endpoint = profile.base_url or "provider default"
+        detail = (
+            f"  [cyan]{escape(name)}[/cyan]{marker}{default}"
+            f" → {escape(profile.provider)}/{escape(profile.model)}"
+            f" [dim]base={escape(endpoint)}[/dim]"
+        )
+        if profile.description:
+            detail += f"\n      [dim]{escape(profile.description)}[/dim]"
+        console.print(detail)
+    console.print("[dim]Use /model <profile-name> to switch.[/dim]")
+
+
+def _select_model_profile(
+    profiles: ModelProfiles,
+    active_name: str | None,
+) -> str | None:
+    """Open a Claude Code-style terminal picker for configured profiles."""
+    if not profiles.profiles:
+        return None
+    values = []
+    for name in profiles.names():
+        profile = profiles.require(name)
+        endpoint = profile.base_url or "provider default"
+        description = f" — {profile.description}" if profile.description else ""
+        values.append((
+            name,
+            f"{name}  {profile.provider}/{profile.model}  [{endpoint}]{description}",
+        ))
+    default = (
+        active_name
+        if active_name in profiles.profiles
+        else profiles.default or values[0][0]
+    )
+    return radiolist_dialog(
+        title="CoreCoder · Select model",
+        text="Use ↑/↓ to choose a configured model profile, Enter to confirm, Esc to cancel.",
+        values=values,
+        default=default,
+        ok_text="Select",
+        cancel_text="Cancel",
+    ).run()
+
+
 def _parse_args():
     p = argparse.ArgumentParser(
         prog="corecoder",
         description="Minimal AI coding agent. Works with any OpenAI-compatible LLM.",
     )
-    p.add_argument("-m", "--model", help="Model name (default: $CORECODER_MODEL or gpt-5.5)")
+    selected = p.add_mutually_exclusive_group()
+    selected.add_argument(
+        "-m", "--model", help="Model name on the current provider (default: $CORECODER_MODEL or gpt-5.5)"
+    )
+    selected.add_argument(
+        "--profile",
+        dest="model_profile",
+        metavar="NAME",
+        help="Named model profile from models.json; switches provider, endpoint and policy together",
+    )
+    p.add_argument(
+        "--model-profiles",
+        metavar="PATH",
+        help="Model profile JSON (default: .corecoder/models.json, then ~/.corecoder/models.json)",
+    )
     p.add_argument(
         "--fallback-model",
         action="append",
@@ -242,6 +389,24 @@ def _parse_args():
         type=_positive_float,
         dest="max_cost_usd",
         help="Hard estimated USD budget for this process",
+    )
+    p.add_argument(
+        "--tool-schema-budget",
+        type=_positive_int,
+        metavar="TOKENS",
+        help=(
+            "Maximum model-visible Tool Schema tokens before lazy discovery "
+            "(default: 10%% of context, capped at 12000)"
+        ),
+    )
+    p.add_argument(
+        "--tool-retrieval-limit",
+        type=_nonnegative_int,
+        metavar="K",
+        help=(
+            "Automatically expose up to K relevant Tool schemas per user turn; "
+            "0 disables automatic retrieval (default: 5)"
+        ),
     )
     p.add_argument("--base-url", help="API base URL (default: $OPENAI_BASE_URL)")
     p.add_argument("--api-key", help="API key (default: $OPENAI_API_KEY)")
@@ -295,12 +460,21 @@ def main():
     # CLI args override env vars
     if args.model:
         config.model = args.model
+        config.model_profile = None
+    if args.model_profile:
+        config.model_profile = args.model_profile
+    if args.model_profiles:
+        config.model_profiles_path = args.model_profiles
     if args.fallback_models:
         config.fallback_models = args.fallback_models
     if args.fallback_routes:
         config.fallback_routes = args.fallback_routes
     if args.max_cost_usd is not None:
         config.max_cost_usd = args.max_cost_usd
+    if args.tool_schema_budget is not None:
+        config.tool_schema_budget_tokens = args.tool_schema_budget
+    if args.tool_retrieval_limit is not None:
+        config.tool_retrieval_limit = args.tool_retrieval_limit
     if args.base_url:
         config.base_url = args.base_url
     if args.api_key:
@@ -328,6 +502,62 @@ def main():
     if args.capability_policy:
         config.capability_policy_path = args.capability_policy
 
+    # Keep raw environment/CLI settings as the inheritance point for every
+    # interactive profile switch.  A profile must never accidentally inherit
+    # a previous profile's endpoint or fallback chain.
+    baseline_config = copy.deepcopy(config)
+    try:
+        model_profiles = load_model_profiles(config.model_profiles_path)
+    except ValueError as e:
+        console.print(f"[red bold]Invalid model profiles:[/] {e}")
+        sys.exit(2)
+
+    # Load a resumed snapshot before constructing the LLM.  That lets a saved
+    # non-secret profile name select the right provider/client first, instead
+    # of restoring only a model string onto an unrelated endpoint.
+    session_store = None
+    resumed = None
+    if config.autosave or args.resume:
+        try:
+            session_store = create_session_store(config.storage_path)
+            resumed = (
+                load_session_record(args.resume, store=session_store)
+                if args.resume else None
+            )
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red bold]Cannot open session storage:[/] {e}")
+            sys.exit(2)
+    if args.resume and resumed is None:
+        console.print(f"[red]Session '{args.resume}' not found.[/red]")
+        sys.exit(1)
+
+    selected_profile_name = config.model_profile
+    profile_selected_explicitly = selected_profile_name is not None
+    if (
+        selected_profile_name is None
+        and resumed is not None
+        and not args.model
+    ):
+        saved_profile = (resumed.metadata or {}).get("model_profile")
+        if isinstance(saved_profile, str) and saved_profile:
+            selected_profile_name = saved_profile
+    if (
+        selected_profile_name is None
+        and not args.model
+        and os.getenv("CORECODER_MODEL") is None
+    ):
+        selected_profile_name = model_profiles.default
+    if selected_profile_name:
+        try:
+            config = apply_model_profile(
+                config,
+                model_profiles.require(selected_profile_name),
+                base=baseline_config,
+            )
+        except ValueError as e:
+            console.print(f"[red bold]Invalid model profile:[/] {e}")
+            sys.exit(2)
+
     if not config.api_key:
         console.print("[red bold]No API key found.[/]")
         console.print(
@@ -344,18 +574,8 @@ def main():
         )
         sys.exit(1)
 
-    llm_cls = LiteLLM if config.provider == "litellm" else LLM
     try:
-        llm = llm_cls(
-            model=config.model,
-            api_key=config.api_key,
-            base_url=config.base_url,
-            fallback_models=config.fallback_models,
-            fallback_routes=config.fallback_routes,
-            max_cost_usd=config.max_cost_usd,
-            temperature=config.temperature,
-            max_tokens=config.max_tokens,
-        )
+        llm = _build_llm(config, profile_name=selected_profile_name)
     except ValueError as e:
         console.print(f"[red bold]Invalid model policy:[/] {e}")
         sys.exit(2)
@@ -396,21 +616,6 @@ def main():
             console.print(f"[red bold]Cannot open trace file:[/] {e}")
             sys.exit(2)
 
-    session_store = None
-    resumed = None
-    if config.autosave or args.resume:
-        try:
-            session_store = create_session_store(config.storage_path)
-            resumed = (
-                load_session_record(args.resume, store=session_store)
-                if args.resume else None
-            )
-        except Exception as e:  # noqa: BLE001
-            console.print(f"[red bold]Cannot open session storage:[/] {e}")
-            sys.exit(2)
-    if args.resume and resumed is None:
-        console.print(f"[red]Session '{args.resume}' not found.[/red]")
-        sys.exit(1)
     session_id = resumed.id if resumed is not None else new_session_id()
     skill_registry = SkillRegistry.discover(Path.cwd())
 
@@ -437,11 +642,23 @@ def main():
         trace=trace,
         state_callback=persist_snapshot if config.autosave else None,
         capability_policy=capability_policy,
+        tool_schema_budget_tokens=config.tool_schema_budget_tokens,
+        tool_retrieval_limit=config.tool_retrieval_limit,
     )
+    agent.model_profile = selected_profile_name
 
     # resume saved session
     if resumed is not None:
-        agent.restore_state(resumed.to_snapshot(), restore_model=not bool(args.model))
+        agent.restore_state(
+            resumed.to_snapshot(),
+            # A CLI/env profile deliberately replaces the saved model.  A
+            # profile discovered from the saved Session only supplies its
+            # provider connection; keep the session's possibly raw-overridden
+            # model name on that connection.
+            restore_model=not bool(args.model or profile_selected_explicitly),
+        )
+        if selected_profile_name:
+            agent.model_profile = selected_profile_name
         config.model = agent.llm.model
         console.print(
             f"[green]Resumed session: {resumed.id} "
@@ -459,7 +676,15 @@ def main():
         return
 
     # interactive REPL
-    _repl(agent, config, session_store, session_id, skill_registry)
+    _repl(
+        agent,
+        config,
+        session_store,
+        session_id,
+        skill_registry,
+        model_profiles=model_profiles,
+        baseline_config=baseline_config,
+    )
 
 
 def _ask_permission(tool_name: str, arguments: dict) -> str:
@@ -516,9 +741,14 @@ def _repl(
     session_store: SessionStore | None = None,
     session_id: str | None = None,
     skill_registry: SkillRegistry | None = None,
+    *,
+    model_profiles: ModelProfiles | None = None,
+    baseline_config: Config | None = None,
 ):
     """Interactive read-eval-print loop."""
     session_id = session_id or new_session_id()
+    model_profiles = model_profiles or ModelProfiles()
+    baseline_config = copy.deepcopy(baseline_config or config)
 
     def active_store() -> SessionStore:
         nonlocal session_store
@@ -546,6 +776,10 @@ def _repl(
     console.print(Panel(
         f"[bold]CoreCoder[/bold] v{__version__}\n"
         f"Model: [cyan]{config.model}[/cyan]"
+        + (
+            f"  Profile: [cyan]{agent.model_profile}[/cyan]"
+            if agent.model_profile else ""
+        )
         + (f"  Base: [dim]{config.base_url}[/dim]" if config.base_url else "")
         + (
             "\nFallbacks: [cyan]"
@@ -576,6 +810,14 @@ def _repl(
             f"\nMCP: [cyan]{mcp_count} tools[/cyan] from {len(mcp_clients)} servers "
             f"[dim]({mcp_mode_text})[/dim]"
             if mcp_count else ""
+        )
+        + (
+            f"\nTool schemas: [cyan]{len(agent.tool_catalog.active_actual_names)}/"
+            f"{len(agent.tools)} active[/cyan], "
+            f"{agent.tool_catalog.active_schema_tokens}/"
+            f"{agent.tool_catalog.budget_tokens} tokens [dim](lazy, auto Top-"
+            f"{agent.tool_retrieval_limit})[/dim]"
+            if agent.tool_catalog.enabled else ""
         )
         + (
             f"\nSkills: [cyan]{len(skill_registry)} available[/cyan]"
@@ -679,15 +921,56 @@ def _repl(
                 line += f"  active model: {agent.llm.model}"
             console.print(line)
             continue
+        if user_input == "/models":
+            _show_model_profiles(model_profiles, agent)
+            continue
         if user_input == "/model" or user_input.startswith("/model "):
-            new_model = user_input[7:].strip() if user_input.startswith("/model ") else ""
-            if new_model:
-                agent.llm.model = new_model
-                config.model = new_model
+            requested = user_input[7:].strip() if user_input.startswith("/model ") else ""
+            if not requested:
+                if not model_profiles.profiles:
+                    console.print(
+                        f"Current model: [cyan]{escape(agent.llm.model)}[/cyan]\n"
+                        "[dim]No named profiles are configured; create "
+                        "~/.corecoder/models.json or use /model <raw-model>.[/dim]"
+                    )
+                    continue
+                requested = _select_model_profile(
+                    model_profiles,
+                    agent.model_profile,
+                ) or ""
+                if not requested:
+                    console.print("[dim]Model selection cancelled.[/dim]")
+                    continue
+            profile = model_profiles.get(requested)
+            if profile is not None:
+                try:
+                    config = _switch_model_profile(
+                        agent,
+                        config,
+                        baseline_config,
+                        profile,
+                    )
+                except ValueError as error:
+                    console.print(
+                        f"[red]Could not switch profile {escape(requested)}: "
+                        f"{escape(str(error))}[/red]"
+                    )
+                    continue
                 agent.persist_state("completed")
-                console.print(f"Switched to [cyan]{new_model}[/cyan]")
+                console.print(
+                    f"Switched to profile [cyan]{escape(profile.name)}[/cyan] "
+                    f"([dim]{escape(profile.provider)}/{escape(profile.model)}[/dim])"
+                )
             else:
-                console.print(f"Current model: [cyan]{agent.llm.model}[/cyan]")
+                # Backwards-compatible short form: /model <raw-model>
+                # keeps the current provider/client but changes its model.
+                agent.llm.model = requested
+                config.model = requested
+                agent.persist_state("completed")
+                console.print(
+                    f"Switched model name to [cyan]{escape(requested)}[/cyan] "
+                    "[dim](current provider settings retained)[/dim]"
+                )
             continue
         if user_input == "/memory":
             rendered = agent.memory.render()
@@ -886,6 +1169,38 @@ def _repl(
                     + (", ".join(required) if required else "[dim]none[/dim]")
                 )
             continue
+        if user_input == "/tools":
+            status = agent.tool_catalog.status()
+            mode = "lazy discovery" if status["lazy_discovery"] else "all schemas active"
+            console.print(
+                f"[bold]Tool schemas[/bold]: {mode}; "
+                f"[cyan]{len(status['active_tools'])}[/cyan] visible, "
+                f"[cyan]{len(status['hidden_tools'])}[/cyan] hidden; "
+                f"{status['active_schema_tokens']}/{status['schema_budget_tokens']} tokens"
+            )
+            if status["lazy_discovery"]:
+                console.print(
+                    "  Automatic retrieval: "
+                    + (
+                        f"Top-{agent.tool_retrieval_limit} per user turn"
+                        if agent.tool_retrieval_limit else "disabled"
+                    )
+                )
+                last = status.get("last_retrieval")
+                if last:
+                    candidates = ", ".join(last["candidates"]) or "none"
+                    console.print(f"  Last candidates: {candidates}")
+            console.print(
+                "  Active: "
+                + (", ".join(status["active_tools"]) or "[dim]none[/dim]")
+            )
+            if status["hidden_tools"]:
+                hidden = status["hidden_tools"]
+                preview = ", ".join(hidden[:30])
+                if len(hidden) > 30:
+                    preview += f", ... (+{len(hidden) - 30})"
+                console.print("  Hidden: " + preview)
+            continue
         if user_input == "/transcript" or user_input.startswith("/transcript "):
             target = (
                 user_input[len("/transcript "):].strip()
@@ -987,8 +1302,9 @@ def _show_help():
         "[bold]Commands:[/bold]\n"
         "  /help          Show this help\n"
         "  /reset         Clear conversation history\n"
-        "  /model         Show current model\n"
-        "  /model <name>  Switch model mid-conversation\n"
+        "  /models        List configured model profiles\n"
+        "  /model         Choose a configured profile with an interactive terminal picker\n"
+        "  /model <name>  Switch to a configured profile, or change only the raw model name\n"
         "  /tokens        Show token usage\n"
         "  /memory        Show structured goal, constraints, plan, and decisions\n"
         "  /goal <text>   Set the persistent task goal (use 'clear' to remove)\n"
@@ -1004,6 +1320,7 @@ def _show_help():
         "  /sessions      List saved sessions\n"
         "  /skills        List workflow skills and active state\n"
         "  /capabilities  Show Tool capabilities and active policy\n"
+        "  /tools         Show active/hidden Tool schemas and schema budget\n"
         "  /transcript [id]  Show the append-only original event history\n"
         "  /delete-session <id>  Delete an inactive session\n"
         "  /agents        List background sub-agents\n"
